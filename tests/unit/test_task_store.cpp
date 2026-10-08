@@ -1,21 +1,31 @@
 // test_task_store.cpp — TaskStore against a real (in-memory) SQLite database
 //
 // Every case runs on ":memory:" except the durability case, which needs a real
-// file and gets one in a self-removing temp directory. No network, no fixed
-// port, no shared state between cases: each TEST opens the store it uses.
+// file and gets one in a self-removing temp directory; the migration cases
+// likewise need a file, because they build an old database with raw SQL and
+// then reopen it through the store. No network, no fixed port, no shared state
+// between cases: each TEST opens the store it uses.
 //
 // The store samples its own clock (see TaskStore.cpp), so timestamp assertions
 // are written as brackets and monotonicity claims rather than equalities to a
 // fixed instant. The one equality asserted is between two columns the store
 // fills from a single sample.
+//
+// The synchronisation cases at the end are the ones that matter most, because
+// a mistake in them loses work rather than failing loudly: the merge round trip
+// pins that two machines whose local ids both start at 1 still end up holding
+// all of both backlogs, and the dry-run case pins that a dry run's report is
+// the report of the merge that follows it.
 
 #include "core/TaskStore.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -28,6 +38,8 @@
 #include "core/Clock.hpp"
 #include "core/Result.hpp"
 #include "core/Task.hpp"
+#include "core/TaskSync.hpp"
+#include "core/Uuid.hpp"
 #include "core/Weights.hpp"
 
 namespace taskpilot
@@ -132,6 +144,135 @@ void expectOk(const Status &status, const char *what)
 }
 
 // ---------------------------------------------------------------------------
+// Export-format helpers
+// ---------------------------------------------------------------------------
+//
+// A merge test has to name a uid before either store has seen it, and has to
+// choose the timestamps the store would otherwise assign — last-write-wins is
+// undecidable if both sides are stamped "now". So these build records in the
+// format TaskSync.hpp documents, from values the test controls.
+//
+// The shape is deliberately spelled out here instead of reusing a serializer:
+// a test that built its records with the code under test's own encoder could
+// not tell a format change from a matching pair of bugs.
+
+/// A fresh v4 uuid, for the records no store has created.
+[[nodiscard]] std::string newUid()
+{
+    const Result<std::string> generated = generateUuidV4();
+    EXPECT_TRUE(generated.ok()) << "generateUuidV4 failed: "
+                                << (generated.ok() ? std::string{} : generated.error().message);
+    return generated.ok() ? generated.value() : std::string{};
+}
+
+/// One live record, compactly dumped so it is a single line.
+[[nodiscard]] std::string liveRecord(const std::string &uid, const std::string &title,
+                                     std::int64_t created_at, std::int64_t updated_at,
+                                     const std::string &status = "open", int importance = 3)
+{
+    const nlohmann::json record{
+        { "v", 1 },
+        { "uid", uid },
+        { "title", title },
+        { "notes", "" },
+        { "status", status },
+        { "importance", importance },
+        { "due_at", nullptr },
+        { "blocks", 0 },
+        { "tags", nlohmann::json::array() },
+        { "created_at", created_at },
+        { "updated_at", updated_at },
+        { "completed_at", nullptr },
+        { "deleted", false },
+    };
+    return record.dump();
+}
+
+/// One tombstone record.
+[[nodiscard]] std::string tombstoneRecord(const std::string &uid, std::int64_t deleted_at)
+{
+    const nlohmann::json record{
+        { "v", 1 },
+        { "uid", uid },
+        { "updated_at", deleted_at },
+        { "deleted", true },
+    };
+    return record.dump();
+}
+
+/// Everything a store holds, ordered by uid so two stores' contents can be
+/// compared without depending on row order (which listTasks deliberately does
+/// not define).
+[[nodiscard]] std::vector<Task> tasksByUid(TaskStore &store)
+{
+    std::vector<Task> tasks =
+        okValue(store.listTasks(TaskFilter{}), std::vector<Task>{}, "listTasks");
+    std::sort(tasks.begin(), tasks.end(),
+              [](const Task &lhs, const Task &rhs) { return lhs.uid < rhs.uid; });
+    return tasks;
+}
+
+/// The uids a store holds, as a set — the shape most merge assertions want.
+[[nodiscard]] std::set<std::string> uidSet(TaskStore &store)
+{
+    std::set<std::string> uids;
+    for (const Task &task : tasksByUid(store)) {
+        uids.insert(task.uid);
+    }
+    return uids;
+}
+
+/// The local ids a store holds, as a set. Used to assert the ids stay unique:
+/// two machines' backlogs both start at 1, and a merge that matched on id
+/// instead of uid would collapse them into one row.
+[[nodiscard]] std::set<std::int64_t> idSet(TaskStore &store)
+{
+    std::set<std::int64_t> ids;
+    for (const Task &task : tasksByUid(store)) {
+        ids.insert(task.id);
+    }
+    return ids;
+}
+
+/// Merge one store's whole export into another, failing the test on either
+/// side's error. The shape every sync case starts from.
+[[nodiscard]] MergeReport mergeFrom(TaskStore &from, TaskStore &to, bool dry_run = false)
+{
+    const std::string exported = okValue(from.exportJsonl(), std::string{}, "exportJsonl");
+    return okValue(to.mergeJsonl(exported, dry_run), MergeReport{}, "mergeJsonl");
+}
+
+/// The titles a store holds, as a set: for asserting that a merge added
+/// everything and overwrote nothing.
+[[nodiscard]] std::set<std::string> titleSet(TaskStore &store)
+{
+    std::set<std::string> titles;
+    for (const Task &task : tasksByUid(store)) {
+        titles.insert(task.title);
+    }
+    return titles;
+}
+
+/// Split an export into its lines. The export is newline-terminated, so the
+/// final element after the last newline is empty and is dropped here — the
+/// tests that care about that byte assert on it directly.
+[[nodiscard]] std::vector<std::string> splitLines(const std::string &text)
+{
+    std::vector<std::string> lines;
+    std::size_t start = 0;
+    while (start < text.size()) {
+        const std::size_t end = text.find('\n', start);
+        if (std::string::npos == end) {
+            lines.push_back(text.substr(start));
+            break;
+        }
+        lines.push_back(text.substr(start, end - start));
+        start = end + 1;
+    }
+    return lines;
+}
+
+// ---------------------------------------------------------------------------
 // Raw column access
 // ---------------------------------------------------------------------------
 //
@@ -145,10 +286,15 @@ void expectOk(const Status &status, const char *what)
 
 /// Open a second connection to the database file at `path`, or nullptr with a
 /// recorded failure when sqlite refuses.
-[[nodiscard]] sqlite3 *openRawConnection(const std::string &path)
+///
+/// `create` opens (and creates) the file. Only the version-0 builder needs it:
+/// it is the first thing to touch its database, while every other caller is
+/// reading a file the store already made.
+[[nodiscard]] sqlite3 *openRawConnection(const std::string &path, bool create = false)
 {
+    const int flags = create ? (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE) : SQLITE_OPEN_READWRITE;
     sqlite3 *db = nullptr;
-    if (SQLITE_OK != sqlite3_open_v2(path.c_str(), &db, SQLITE_OPEN_READWRITE, nullptr)) {
+    if (SQLITE_OK != sqlite3_open_v2(path.c_str(), &db, flags, nullptr)) {
         const std::string detail = (nullptr != db) ? sqlite3_errmsg(db) : "out of memory";
         sqlite3_close(db);
         ADD_FAILURE() << "raw open of " << path << " failed: " << detail;
@@ -236,6 +382,95 @@ void expectOk(const Status &status, const char *what)
     return storage_class;
 }
 
+/// Run one statement on a fresh raw connection and return sqlite's result code.
+/// `sql` is a literal from this file, never data: binding is how values travel,
+/// even in a test.
+[[nodiscard]] int runRaw(const std::string &path, const std::string &sql, bool create = false)
+{
+    sqlite3 *db = openRawConnection(path, create);
+    if (nullptr == db) {
+        return SQLITE_ERROR;
+    }
+    char *message = nullptr;
+    const int result = sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &message);
+    sqlite3_free(message);
+    sqlite3_close(db);
+    return result;
+}
+
+/// Read one TEXT value from the raw database. `sql` is a literal from this
+/// file, and the query is expected to return exactly one row with one column —
+/// anything else is recorded as a failure, because a missing row would
+/// otherwise make an assertion pass for the wrong reason.
+[[nodiscard]] std::string rawScalarText(const std::string &path, const std::string &sql)
+{
+    sqlite3 *db = openRawConnection(path);
+    if (nullptr == db) {
+        return std::string{};
+    }
+    sqlite3_stmt *stmt = nullptr;
+    if (SQLITE_OK != sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr)) {
+        ADD_FAILURE() << "raw prepare failed (" << sqlite3_errmsg(db) << "): " << sql;
+        sqlite3_close(db);
+        return std::string{};
+    }
+    std::string value;
+    if (SQLITE_ROW == sqlite3_step(stmt)) {
+        const unsigned char *text = sqlite3_column_text(stmt, 0);
+        if (nullptr != text) {
+            value = reinterpret_cast<const char *>(text);
+        }
+    } else {
+        ADD_FAILURE() << "raw query returned no row: " << sql;
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return value;
+}
+
+/// Build the database a build from before `uid` existed left behind: the old
+/// tasks table (no uid column, no tombstones table) and two rows with data
+/// worth not losing.
+///
+/// The settings row is the interesting part. That build wrote
+/// schema_version='1' without ever reading it — the constant lived in
+/// TaskStore.cpp with a comment saying nothing read it yet — so the database
+/// that needs migrating is one that CLAIMS to be current while having no uid
+/// column at all. A migration keyed on that row skips exactly the database it
+/// exists for, which is why the test asserts this row is present before it
+/// opens the store.
+///
+/// Returns true when every statement applied.
+[[nodiscard]] bool buildVersionZeroDatabase(const std::string &path)
+{
+    const std::string schema = R"sql(
+CREATE TABLE tasks (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    title        TEXT    NOT NULL,
+    notes        TEXT    NOT NULL DEFAULT '',
+    status       TEXT    NOT NULL DEFAULT 'open',
+    importance   INTEGER NOT NULL DEFAULT 3,
+    due_at       INTEGER,
+    blocks       INTEGER NOT NULL DEFAULT 0,
+    tags         TEXT    NOT NULL DEFAULT '[]',
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    completed_at INTEGER
+);
+CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT INTO settings(key, value) VALUES('schema_version', '1');
+INSERT INTO tasks(title, notes, status, importance, due_at, blocks, tags,
+                  created_at, updated_at, completed_at)
+VALUES('legacy one', 'written before uids existed', 'in_progress', 4, 1700000000, 2, '["work"]',
+       1600000000, 1600000500, NULL),
+      ('legacy two', '', 'done', 2, NULL, 0, '[]',
+       1600000100, 1600000200, 1600000300);
+)sql";
+    // create: this helper is the first thing to touch the file, exactly as the
+    // old build was the first to touch its own database.
+    return SQLITE_OK == runRaw(path, schema, true);
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
@@ -295,6 +530,124 @@ TEST(TaskStoreTest, FileBackedStoreKeepsItsDataAcrossReopen)
 }
 
 // ---------------------------------------------------------------------------
+// The version-0 migration
+// ---------------------------------------------------------------------------
+//
+// This is the real migration, not a hypothetical: the database in the field
+// has the old table shape and a schema_version row that says the same thing
+// this build does. Everything that can go wrong here loses the user's backlog,
+// so the cases below check the data, the identity, the new table, the version
+// and the idempotence, in that order.
+
+TEST(TaskStoreTest, OpenMigratesAVersionZeroDatabaseInPlace)
+{
+    const TempDir directory;
+    const std::string path = directory.file("legacy.db");
+    ASSERT_TRUE(buildVersionZeroDatabase(path)) << "could not plant the old database";
+
+    // Before: no uid column, and a settings row claiming version 1. The
+    // COALESCE keeps this a one-row query, so a missing column reads as
+    // 'absent' rather than as a failed query.
+    EXPECT_EQ("absent",
+              rawScalarText(path, "SELECT COALESCE((SELECT name FROM pragma_table_info('tasks') "
+                                  "WHERE name = 'uid'), 'absent')"));
+    EXPECT_EQ("1", rawScalarText(path, "SELECT value FROM settings WHERE key = 'schema_version'"));
+
+    std::int64_t first_id = 0;
+    std::string first_uid;
+    {
+        const std::unique_ptr<TaskStore> migrated = openStore(path);
+        ASSERT_NE(nullptr, migrated);
+
+        // Row 1 kept every field it had, byte for byte. The ids are still 1 and
+        // 2: adding a column and backfilling it must not renumber rows, or
+        // every id a client is holding silently points at another task.
+        const Task one = okValue(migrated->getTask(1), Task{}, "getTask");
+        EXPECT_EQ("legacy one", one.title);
+        EXPECT_EQ("written before uids existed", one.notes);
+        EXPECT_EQ(TaskStatus::kInProgress, one.status);
+        EXPECT_EQ(4, one.importance);
+        ASSERT_TRUE(one.due_at.has_value());
+        EXPECT_EQ(1700000000, *one.due_at);
+        EXPECT_EQ(2, one.blocks);
+        EXPECT_EQ(std::vector<std::string>({ "work" }), one.tags);
+        EXPECT_EQ(1600000000, one.created_at);
+        EXPECT_EQ(1600000500, one.updated_at);
+
+        const Task two = okValue(migrated->getTask(2), Task{}, "getTask");
+        EXPECT_EQ("legacy two", two.title);
+        EXPECT_EQ(TaskStatus::kDone, two.status);
+        EXPECT_EQ(2, two.importance);
+        EXPECT_FALSE(two.due_at.has_value());
+        ASSERT_TRUE(two.completed_at.has_value());
+        EXPECT_EQ(1600000300, *two.completed_at);
+
+        // And gained the identity the feature is about: a well-formed v4 uuid,
+        // one per row. A shared or missing uid would leave two machines unable
+        // to tell these tasks apart — the exact collision uid exists to stop.
+        EXPECT_TRUE(looksLikeUuidV4(one.uid)) << "migrated uid is not a v4 uuid: " << one.uid;
+        EXPECT_TRUE(looksLikeUuidV4(two.uid)) << "migrated uid is not a v4 uuid: " << two.uid;
+        EXPECT_NE(one.uid, two.uid);
+
+        // The tombstones table exists (reading it is how that is proven: a
+        // missing table fails the query) and starts empty, because nothing has
+        // been deleted yet.
+        EXPECT_EQ(0U, okValue(migrated->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
+
+        // The rows are findable by the new identity, not only by id.
+        const Task by_uid = okValue(migrated->getTaskByUid(one.uid), Task{}, "getTaskByUid");
+        EXPECT_EQ(one.id, by_uid.id);
+        EXPECT_EQ("legacy one", by_uid.title);
+
+        first_id = one.id;
+        first_uid = one.uid;
+    }
+
+    // The version row now describes a database that really is at version 1.
+    EXPECT_EQ("1", rawScalarText(path, "SELECT value FROM settings WHERE key = 'schema_version'"));
+
+    // Reopening a migrated database changes NOTHING: same uid, same rows, same
+    // tombstone count. This is what makes it safe to run the migration on every
+    // open — a second pass that re-assigned uids would make every task a
+    // stranger to the other machine, and the next merge would duplicate the
+    // whole backlog.
+    {
+        const std::unique_ptr<TaskStore> again = openStore(path);
+        ASSERT_NE(nullptr, again);
+
+        const Task one = okValue(again->getTask(first_id), Task{}, "getTask");
+        EXPECT_EQ(first_uid, one.uid);
+        EXPECT_EQ("legacy one", one.title);
+        EXPECT_EQ(2U, tasksByUid(*again).size());
+        EXPECT_EQ(0U, okValue(again->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
+    }
+}
+
+TEST(TaskStoreTest, MigratedDatabaseEnforcesTheUniqueUidIndex)
+{
+    const TempDir directory;
+    const std::string path = directory.file("unique_uid.db");
+    ASSERT_TRUE(buildVersionZeroDatabase(path));
+
+    const std::unique_ptr<TaskStore> store = openStore(path);
+    ASSERT_NE(nullptr, store);
+    const Task first = okValue(store->getTask(1), Task{}, "getTask");
+
+    // The invariant is the database's, not a convention: a second row claiming
+    // the first row's uid is refused by the index. Without it a hand-written or
+    // restored row could duplicate an identity, and a merge cannot resolve two
+    // rows with one uid — it would pick one and destroy the other.
+    const std::string impostor =
+        "INSERT INTO tasks(uid, title, created_at, updated_at) VALUES('" + first.uid +
+        "', 'impostor', 1, 1)";
+    EXPECT_EQ(SQLITE_CONSTRAINT, runRaw(path, impostor));
+
+    // The refusal changed nothing: still two rows, still no impostor.
+    EXPECT_EQ(2U, tasksByUid(*store).size());
+    EXPECT_EQ(2U, uidSet(*store).size());
+}
+
+// ---------------------------------------------------------------------------
 // addTask
 // ---------------------------------------------------------------------------
 
@@ -324,6 +677,41 @@ TEST(TaskStoreTest, AddTaskAssignsIdentityAndTimestamps)
     EXPECT_EQ(stored.created_at, stored.updated_at);
     EXPECT_FALSE(stored.completed_at.has_value());
     EXPECT_TRUE(stored.isActionable());
+}
+
+TEST(TaskStoreTest, AddTaskAssignsAUidAndOverwritesTheCallers)
+{
+    const std::unique_ptr<TaskStore> store = openStore(":memory:");
+    ASSERT_NE(nullptr, store);
+
+    Task draft = draftTask("identity comes from the store");
+    // A client-chosen uid is discarded exactly like a client-chosen id. It is
+    // the more dangerous of the two: a forged uid can collide with a task
+    // arriving from another machine, and the collision destroys one of the two
+    // at the next merge — silently, and on the other machine.
+    draft.uid = "00000000-0000-4000-8000-000000000000";
+
+    const Task stored = okValue(store->addTask(draft), Task{}, "addTask");
+    EXPECT_TRUE(looksLikeUuidV4(stored.uid)) << "uid is not a v4 uuid: " << stored.uid;
+    EXPECT_NE(draft.uid, stored.uid);
+
+    // The uid belongs to the row, not merely to the returned copy.
+    const Task fetched = okValue(store->getTask(stored.id), Task{}, "getTask");
+    EXPECT_EQ(stored.uid, fetched.uid);
+    const Task by_uid = okValue(store->getTaskByUid(stored.uid), Task{}, "getTaskByUid");
+    EXPECT_EQ(stored.id, by_uid.id);
+    EXPECT_EQ(stored.title, by_uid.title);
+
+    // The forged uid was not stored as an alias for the row.
+    const Result<Task> forged = store->getTaskByUid(draft.uid);
+    ASSERT_FALSE(forged.ok());
+    EXPECT_EQ(ErrorCode::kNotFound, forged.error().code);
+
+    // Two tasks created here never share an identity: the uniqueness the merge
+    // relies on has to come from generation, not from luck.
+    const Task second = okValue(store->addTask(draftTask("the other one")), Task{}, "addTask");
+    EXPECT_TRUE(looksLikeUuidV4(second.uid));
+    EXPECT_NE(stored.uid, second.uid);
 }
 
 TEST(TaskStoreTest, AddTaskRejectsBadFieldsAndNamesThem)
@@ -1107,6 +1495,505 @@ TEST(TaskStoreTest, DeletingTwiceReportsNotFoundTheSecondTime)
     EXPECT_EQ(ErrorCode::kNotFound, third.error().code);
     const Task survivor = okValue(store->getTask(kept.id), Task{}, "getTask");
     EXPECT_EQ("kept", survivor.title);
+}
+
+TEST(TaskStoreTest, DeleteLeavesATombstoneNamingTheUid)
+{
+    const std::unique_ptr<TaskStore> store = openStore(":memory:");
+    ASSERT_NE(nullptr, store);
+
+    const Task task = okValue(store->addTask(draftTask("delete me")), Task{}, "addTask");
+    EXPECT_EQ(0U, okValue(store->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
+
+    expectOk(store->deleteTask(task.id), "deleteTask");
+
+    // The row is gone from the task side and the deletion is recorded against
+    // the uid. Without that record the other machine's next export would
+    // insert the task straight back, and the delete would appear to undo
+    // itself overnight.
+    EXPECT_EQ(1U, okValue(store->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
+    const Result<Task> gone = store->getTaskByUid(task.uid);
+    ASSERT_FALSE(gone.ok());
+    EXPECT_EQ(ErrorCode::kNotFound, gone.error().code);
+
+    // The tombstone is a record in the export, carrying the uid and a stamp at
+    // least as new as the task it replaces — which is what makes a delete beat
+    // a same-second edit on the other machine.
+    const std::string exported = okValue(store->exportJsonl(), std::string{}, "exportJsonl");
+    const std::vector<std::string> lines = splitLines(exported);
+    ASSERT_EQ(1U, lines.size());
+    const nlohmann::json record = nlohmann::json::parse(lines.front());
+    EXPECT_EQ(task.uid, record.at("uid").get<std::string>());
+    EXPECT_TRUE(record.at("deleted").get<bool>());
+    EXPECT_GE(record.at("updated_at").get<std::int64_t>(), task.updated_at);
+
+    // A second delete reports kNotFound even though that tombstone exists:
+    // from the caller's side "it is gone" is the truth, and the tombstone is
+    // bookkeeping rather than a task — see TaskStore.hpp.
+    const Status second = store->deleteTask(task.id);
+    ASSERT_FALSE(second.ok());
+    EXPECT_EQ(ErrorCode::kNotFound, second.error().code);
+    EXPECT_EQ(1U, okValue(store->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
+}
+
+// ---------------------------------------------------------------------------
+// Synchronisation — the export format and the merge
+// ---------------------------------------------------------------------------
+//
+// A merge is the one operation here that can destroy work rather than fail
+// loudly, so these cases are written around what a wrong merge does to a real
+// backlog: two machines whose local ids collide, an edit that must not be
+// overwritten by a stale copy, a delete that has to travel, and a dry run whose
+// report has to be the truth.
+
+TEST(TaskStoreTest, ExportJsonlIsSortedByUidOneLinePerUid)
+{
+    const std::unique_ptr<TaskStore> store = openStore(":memory:");
+    ASSERT_NE(nullptr, store);
+
+    // Created in an order unrelated to uid order, so a passing sort assertion
+    // cannot be an artifact of insertion order.
+    const Task alpha = okValue(store->addTask(draftTask("alpha")), Task{}, "addTask");
+    const Task beta = okValue(store->addTask(draftTask("beta")), Task{}, "addTask");
+    const Task gamma = okValue(store->addTask(draftTask("gamma")), Task{}, "addTask");
+    expectOk(store->deleteTask(beta.id), "deleteTask");
+
+    const std::string exported = okValue(store->exportJsonl(), std::string{}, "exportJsonl");
+
+    // Newline-terminated, last line included: a file that lost its final byte
+    // is then visibly truncated rather than silently valid.
+    ASSERT_FALSE(exported.empty());
+    EXPECT_EQ('\n', exported.back());
+
+    const std::vector<std::string> lines = splitLines(exported);
+    ASSERT_EQ(3U, lines.size()); // two live tasks plus one tombstone
+
+    std::vector<std::string> uids;
+    for (const std::string &line : lines) {
+        // No line may carry the local integer id: it is this database's row
+        // number, and a reader that matched on it would pair two machines'
+        // unrelated "row 2"s — the silent data loss the format exists to stop.
+        EXPECT_EQ(std::string::npos, line.find("\"id\""))
+            << "an export line carries the local id: " << line;
+        // Each line stands alone as JSON; the format is not text to be split.
+        const nlohmann::json record = nlohmann::json::parse(line);
+        EXPECT_EQ(1, record.at("v").get<int>());
+        uids.push_back(record.at("uid").get<std::string>());
+    }
+
+    // Sorted by uid — the property that lets git merge two machines' exports
+    // line by line instead of conflicting wholesale, because a change to one
+    // task moves exactly one line.
+    std::vector<std::string> expected{ alpha.uid, beta.uid, gamma.uid };
+    std::sort(expected.begin(), expected.end());
+    EXPECT_EQ(expected, uids);
+
+    // One line per uid, even though beta changed state from task to tombstone:
+    // the file is a snapshot keyed by uid, not a log of events.
+    const std::set<std::string> distinct(uids.begin(), uids.end());
+    EXPECT_EQ(3U, distinct.size());
+}
+
+TEST(TaskStoreTest, MergeRoundTripKeepsBothMachinesBacklogs)
+{
+    const std::unique_ptr<TaskStore> a = openStore(":memory:");
+    const std::unique_ptr<TaskStore> b = openStore(":memory:");
+    ASSERT_NE(nullptr, a);
+    ASSERT_NE(nullptr, b);
+
+    // Two machines that have never met. Each numbers its own rows from 1 —
+    // that is the collision the feature exists to fix, so assert it rather
+    // than assume it, because a test that cannot reproduce the bug cannot
+    // prove it is fixed.
+    const Task a1 = okValue(a->addTask(draftTask("a one")), Task{}, "addTask");
+    const Task a2 = okValue(a->addTask(draftTask("a two")), Task{}, "addTask");
+    const Task b1 = okValue(b->addTask(draftTask("b one")), Task{}, "addTask");
+    const Task b2 = okValue(b->addTask(draftTask("b two")), Task{}, "addTask");
+    ASSERT_EQ(1, a1.id);
+    ASSERT_EQ(2, a2.id);
+    ASSERT_EQ(1, b1.id);
+    ASSERT_EQ(2, b2.id);
+    EXPECT_NE(a1.uid, b1.uid);
+
+    // B learns A's two tasks, then A learns all four of B's.
+    const MergeReport into_b = mergeFrom(*a, *b);
+    EXPECT_EQ(2U, into_b.inserted);
+    EXPECT_EQ(0U, into_b.updated);
+    EXPECT_EQ(0U, into_b.skipped);
+    EXPECT_FALSE(into_b.clean());
+
+    const MergeReport into_a = mergeFrom(*b, *a);
+    EXPECT_EQ(2U, into_a.inserted) << "the tasks A already had must not be inserted twice";
+    EXPECT_EQ(2U, into_a.skipped) << "a task that came back unchanged is not an update";
+    EXPECT_EQ(0U, into_a.updated);
+
+    // Both machines hold all four — the whole point of the feature.
+    const std::set<std::string> expected{ "a one", "a two", "b one", "b two" };
+    for (TaskStore *store : { a.get(), b.get() }) {
+        EXPECT_EQ(4U, tasksByUid(*store).size()) << "a machine lost a task in the merge";
+        EXPECT_EQ(4U, uidSet(*store).size()) << "two tasks ended up sharing a uid";
+        // Four distinct local row numbers. The incoming records carried no
+        // local id by design, so the merge had to assign new ones — an
+        // implementation that reused or copied ids would collide here.
+        EXPECT_EQ(4U, idSet(*store).size()) << "local ids collided after the merge";
+        EXPECT_EQ(expected, titleSet(*store)) << "a task was overwritten rather than added";
+    }
+
+    // A's own rows are untouched, stamps included: a skipped record must not
+    // even count as a touch, or every sync would look like an edit to the
+    // other machine.
+    const Task a1_after = okValue(a->getTask(a1.id), Task{}, "getTask");
+    EXPECT_EQ(a1.uid, a1_after.uid);
+    EXPECT_EQ(a1.title, a1_after.title);
+    EXPECT_EQ(a1.created_at, a1_after.created_at);
+    EXPECT_EQ(a1.updated_at, a1_after.updated_at);
+    const Task a2_after = okValue(a->getTask(a2.id), Task{}, "getTask");
+    EXPECT_EQ(a2.uid, a2_after.uid);
+    EXPECT_EQ(a2.updated_at, a2_after.updated_at);
+
+    // The sync has converged: a further pass in either direction is a no-op.
+    const MergeReport quiet = mergeFrom(*a, *b);
+    EXPECT_TRUE(quiet.clean());
+    EXPECT_EQ(4U, quiet.skipped);
+}
+
+TEST(TaskStoreTest, MergeTakesTheNewerEditAndSkipsTheOlder)
+{
+    const std::unique_ptr<TaskStore> a = openStore(":memory:");
+    const std::unique_ptr<TaskStore> b = openStore(":memory:");
+    ASSERT_NE(nullptr, a);
+    ASSERT_NE(nullptr, b);
+
+    const Task t1 = okValue(a->addTask(draftTask("t1 original")), Task{}, "addTask");
+    const Task t2 = okValue(a->addTask(draftTask("t2 original")), Task{}, "addTask");
+    ASSERT_EQ(2U, mergeFrom(*a, *b).inserted);
+
+    // One export carrying both outcomes: a strictly newer record for t1, a
+    // strictly older one for t2. The stamps are hand-picked because that is
+    // what last-write-wins compares — "now" on both sides would make the
+    // outcome depend on the clock's resolution.
+    const std::string jsonl =
+        liveRecord(t1.uid, "t1 edited later", t1.created_at, t1.updated_at + 500) + "\n" +
+        liveRecord(t2.uid, "t2 edited earlier", t2.created_at, t2.updated_at - 500) + "\n";
+
+    const MergeReport report = okValue(b->mergeJsonl(jsonl, false), MergeReport{}, "mergeJsonl");
+    EXPECT_EQ(0U, report.inserted);
+    EXPECT_EQ(1U, report.updated);
+    EXPECT_EQ(1U, report.skipped);
+    EXPECT_FALSE(report.clean());
+    ASSERT_EQ(1U, report.updated_titles.size());
+    EXPECT_EQ("t1 edited later", report.updated_titles.front());
+    // The loser is not listed among the examples: it changed nothing, and a
+    // dry run that named it would be describing a merge that did not happen.
+    EXPECT_TRUE(report.deleted_titles.empty());
+
+    const Task t1_in_b = okValue(b->getTaskByUid(t1.uid), Task{}, "getTaskByUid");
+    EXPECT_EQ("t1 edited later", t1_in_b.title);
+    EXPECT_EQ(t1.updated_at + 500, t1_in_b.updated_at);
+    // created_at is history: the merge copied the fields a user can change and
+    // left the birth stamp alone.
+    EXPECT_EQ(t1.created_at, t1_in_b.created_at);
+
+    const Task t2_in_b = okValue(b->getTaskByUid(t2.uid), Task{}, "getTaskByUid");
+    EXPECT_EQ("t2 original", t2_in_b.title) << "an older record overwrote a newer task";
+    EXPECT_EQ(t2.updated_at, t2_in_b.updated_at);
+
+    // The other direction: the same file against the machine that produced the
+    // original stamps. Same outcome, because last-write-wins is a property of
+    // the stamps and not of who is merging.
+    const MergeReport mirrored = okValue(a->mergeJsonl(jsonl, false), MergeReport{}, "mergeJsonl");
+    EXPECT_EQ(1U, mirrored.updated);
+    EXPECT_EQ(1U, mirrored.skipped);
+    EXPECT_EQ("t1 edited later", okValue(a->getTaskByUid(t1.uid), Task{}, "getTaskByUid").title);
+    EXPECT_EQ("t2 original", okValue(a->getTaskByUid(t2.uid), Task{}, "getTaskByUid").title);
+
+    // Both sides now agree, so replaying the same file changes nothing: this is
+    // the convergence a sync is supposed to reach, and it is also what stops
+    // two machines from trading the same edit back and forth.
+    const MergeReport again = okValue(a->mergeJsonl(jsonl, false), MergeReport{}, "mergeJsonl");
+    EXPECT_TRUE(again.clean());
+    EXPECT_EQ(2U, again.skipped);
+}
+
+TEST(TaskStoreTest, MergeCarriesADeletionAcrossMachines)
+{
+    const std::unique_ptr<TaskStore> a = openStore(":memory:");
+    const std::unique_ptr<TaskStore> b = openStore(":memory:");
+    ASSERT_NE(nullptr, a);
+    ASSERT_NE(nullptr, b);
+
+    const Task task = okValue(a->addTask(draftTask("delete this one")), Task{}, "addTask");
+    ASSERT_EQ(1U, mergeFrom(*a, *b).inserted);
+    ASSERT_TRUE(b->getTaskByUid(task.uid).ok());
+
+    expectOk(a->deleteTask(task.id), "deleteTask");
+    const MergeReport deletion = mergeFrom(*a, *b);
+    EXPECT_EQ(1U, deletion.deleted);
+    EXPECT_EQ(0U, deletion.inserted) << "the tombstone was read as a new task";
+    ASSERT_EQ(1U, deletion.deleted_titles.size());
+    EXPECT_EQ("delete this one", deletion.deleted_titles.front());
+
+    // Gone on B as well, and recorded as gone there: without the tombstone B
+    // would keep exporting the task and A would keep re-inserting it, which
+    // looks exactly like the tool ignoring a delete.
+    const Result<Task> gone = b->getTaskByUid(task.uid);
+    ASSERT_FALSE(gone.ok());
+    EXPECT_EQ(ErrorCode::kNotFound, gone.error().code);
+    EXPECT_EQ(1U, okValue(b->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
+
+    // B's export now describes the deletion, and the uid appears exactly once —
+    // as the tombstone, never as both a task and a tombstone.
+    const std::string b_export = okValue(b->exportJsonl(), std::string{}, "exportJsonl");
+    const std::vector<std::string> lines = splitLines(b_export);
+    ASSERT_EQ(1U, lines.size());
+    const nlohmann::json record = nlohmann::json::parse(lines.front());
+    EXPECT_EQ(task.uid, record.at("uid").get<std::string>());
+    EXPECT_TRUE(record.at("deleted").get<bool>());
+
+    // Sending the tombstone back is a no-op, not a resurrection and not a
+    // second tombstone.
+    const MergeReport echo = mergeFrom(*b, *a);
+    EXPECT_TRUE(echo.clean());
+    EXPECT_EQ(1U, okValue(a->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
+}
+
+TEST(TaskStoreTest, MergeResurrectsATaskEditedAfterItsDelete)
+{
+    const std::unique_ptr<TaskStore> a = openStore(":memory:");
+    const std::unique_ptr<TaskStore> b = openStore(":memory:");
+    ASSERT_NE(nullptr, a);
+    ASSERT_NE(nullptr, b);
+
+    const Task task = okValue(a->addTask(draftTask("kept in sync")), Task{}, "addTask");
+    ASSERT_EQ(1U, mergeFrom(*a, *b).inserted);
+
+    // A deletes it, and B has not synced yet.
+    expectOk(a->deleteTask(task.id), "deleteTask");
+    ASSERT_EQ(1U, okValue(a->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
+    ASSERT_FALSE(a->getTaskByUid(task.uid).ok());
+
+    // B edits the task to a strictly newer stamp. Delete is not a permanent
+    // ban, it is just the latest write, so a later edit outranks it
+    // (TaskSync.hpp). The stamp is chosen, not sampled: the test has to know it
+    // is strictly newer than the tombstone.
+    const std::string edit =
+        liveRecord(task.uid, "edited after the delete", task.created_at, task.updated_at + 1000);
+    const MergeReport edited = okValue(b->mergeJsonl(edit, false), MergeReport{}, "mergeJsonl");
+    ASSERT_EQ(1U, edited.updated);
+
+    // Now A merges B: a tombstone on A, a strictly newer live record arriving.
+    const MergeReport resurrected = mergeFrom(*b, *a);
+    EXPECT_EQ(1U, resurrected.resurrected);
+    EXPECT_EQ(0U, resurrected.inserted) << "a resurrection is not an insert: the tombstone had to go too";
+    EXPECT_EQ(0U, resurrected.deleted);
+    ASSERT_EQ(1U, resurrected.resurrected_titles.size());
+    EXPECT_EQ("edited after the delete", resurrected.resurrected_titles.front());
+
+    const Task back = okValue(a->getTaskByUid(task.uid), Task{}, "getTaskByUid");
+    EXPECT_EQ("edited after the delete", back.title);
+    EXPECT_EQ(task.updated_at + 1000, back.updated_at);
+    EXPECT_EQ(task.created_at, back.created_at);
+    // Re-created as a local row: the resurrected task carries a fresh id
+    // because the old row no longer exists, and nothing may depend on the id
+    // surviving a delete.
+    EXPECT_NE(task.id, back.id);
+
+    // The tombstone is gone from the table and from the export, so this machine
+    // no longer claims the task is deleted anywhere.
+    EXPECT_EQ(0U, okValue(a->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
+    const std::string exported = okValue(a->exportJsonl(), std::string{}, "exportJsonl");
+    const std::vector<std::string> lines = splitLines(exported);
+    ASSERT_EQ(1U, lines.size());
+    const nlohmann::json record = nlohmann::json::parse(lines.front());
+    EXPECT_FALSE(record.at("deleted").get<bool>());
+    EXPECT_EQ("edited after the delete", record.at("title").get<std::string>());
+
+    // And the two machines agree again.
+    const MergeReport echo = mergeFrom(*a, *b);
+    EXPECT_TRUE(echo.clean());
+}
+
+TEST(TaskStoreTest, ATombstoneForAnUnknownUidChangesNothing)
+{
+    const std::unique_ptr<TaskStore> store = openStore(":memory:");
+    ASSERT_NE(nullptr, store);
+    const Task kept = okValue(store->addTask(draftTask("still here")), Task{}, "addTask");
+
+    const MergeReport report =
+        okValue(store->mergeJsonl(tombstoneRecord(newUid(), 1700000000) + "\n", false),
+                MergeReport{}, "mergeJsonl");
+    EXPECT_EQ(1U, report.skipped);
+    EXPECT_TRUE(report.clean());
+
+    // A delete for a task this machine never had inserts nothing: no task
+    // appears, and no tombstone is stored for a uid that was never here —
+    // storing one would let a stray line in an old export claim this machine
+    // deliberately deleted something it never saw.
+    const std::vector<Task> tasks = tasksByUid(*store);
+    ASSERT_EQ(1U, tasks.size());
+    EXPECT_EQ(kept.uid, tasks.front().uid);
+    EXPECT_EQ(0U, okValue(store->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
+}
+
+TEST(TaskStoreTest, DryRunReportsTheMergeWithoutPerformingIt)
+{
+    const std::unique_ptr<TaskStore> a = openStore(":memory:");
+    const std::unique_ptr<TaskStore> b = openStore(":memory:");
+    ASSERT_NE(nullptr, a);
+    ASSERT_NE(nullptr, b);
+
+    const Task one = okValue(a->addTask(draftTask("one")), Task{}, "addTask");
+    const Task two = okValue(a->addTask(draftTask("two")), Task{}, "addTask");
+    ASSERT_EQ(2U, mergeFrom(*a, *b).inserted);
+
+    // A file that would insert one, update one and delete one, so the reported
+    // counts are not trivially zero.
+    const std::string fresh_uid = newUid();
+    const std::string jsonl =
+        liveRecord(fresh_uid, "brand new", 1700000000, 1700000000) + "\n" +
+        liveRecord(one.uid, "one edited", one.created_at, one.updated_at + 100) + "\n" +
+        tombstoneRecord(two.uid, two.updated_at) + "\n";
+
+    const MergeReport predicted = okValue(b->mergeJsonl(jsonl, true), MergeReport{}, "mergeJsonl");
+    EXPECT_EQ(1U, predicted.inserted);
+    EXPECT_EQ(1U, predicted.updated);
+    EXPECT_EQ(1U, predicted.deleted);
+    EXPECT_EQ(0U, predicted.skipped);
+    EXPECT_FALSE(predicted.clean());
+
+    // Nothing happened. Every assertion below fails if the dry run wrote
+    // anything: the insert is absent, "one" is unedited, "two" is still there
+    // and no tombstone appeared. That is what makes --dry-run trustworthy.
+    EXPECT_EQ(2U, tasksByUid(*b).size());
+    const Result<Task> absent = b->getTaskByUid(fresh_uid);
+    ASSERT_FALSE(absent.ok());
+    EXPECT_EQ(ErrorCode::kNotFound, absent.error().code);
+    const Task one_before = okValue(b->getTaskByUid(one.uid), Task{}, "getTaskByUid");
+    EXPECT_EQ("one", one_before.title);
+    EXPECT_EQ(one.updated_at, one_before.updated_at);
+    const Task two_before = okValue(b->getTaskByUid(two.uid), Task{}, "getTaskByUid");
+    EXPECT_EQ("two", two_before.title);
+    EXPECT_EQ(0U, okValue(b->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
+
+    // The real merge produces the SAME report — byte for byte through the wire
+    // serializer — which is the property TaskStore.hpp says a dry run has to
+    // have to be worth anything.
+    const MergeReport applied = okValue(b->mergeJsonl(jsonl, false), MergeReport{}, "mergeJsonl");
+    EXPECT_EQ(toJson(predicted).dump(), toJson(applied).dump());
+
+    // And it really applied.
+    EXPECT_EQ(2U, tasksByUid(*b).size()); // "one" was updated in place, "two" removed
+    const Task fresh = okValue(b->getTaskByUid(fresh_uid), Task{}, "getTaskByUid");
+    EXPECT_EQ("brand new", fresh.title);
+    const Task one_after = okValue(b->getTaskByUid(one.uid), Task{}, "getTaskByUid");
+    EXPECT_EQ("one edited", one_after.title);
+    EXPECT_EQ(one.updated_at + 100, one_after.updated_at);
+    EXPECT_FALSE(b->getTaskByUid(two.uid).ok());
+    EXPECT_EQ(1U, okValue(b->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
+}
+
+TEST(TaskStoreTest, AMalformedExportLeavesTheStoreUntouched)
+{
+    const std::unique_ptr<TaskStore> store = openStore(":memory:");
+    ASSERT_NE(nullptr, store);
+    const Task known = okValue(store->addTask(draftTask("untouched")), Task{}, "addTask");
+
+    // Line 1 is a perfectly good record; line 2 is truncated JSON. The parse
+    // fails the whole call before any write and names the line, because a
+    // partial import would leave the store holding a task the file never fully
+    // described — and the next sync would treat that fragment as truth.
+    const std::string jsonl =
+        liveRecord(newUid(), "would have been inserted", 1700000000, 1700000000) + "\n" +
+        "{\"v\":1,\"uid\":\"" + newUid() + "\",";
+    const Result<MergeReport> merged = store->mergeJsonl(jsonl, false);
+    ASSERT_FALSE(merged.ok());
+    EXPECT_EQ(ErrorCode::kInvalidArgument, merged.error().code);
+    EXPECT_NE(std::string::npos, merged.error().message.find("2"))
+        << "the error must name the offending line: " << merged.error().message;
+
+    const std::vector<Task> tasks = tasksByUid(*store);
+    ASSERT_EQ(1U, tasks.size()) << "the merge wrote part of a file it rejected";
+    EXPECT_EQ(known.uid, tasks.front().uid);
+    EXPECT_EQ("untouched", tasks.front().title);
+    EXPECT_EQ(known.updated_at, tasks.front().updated_at);
+    EXPECT_EQ(0U, okValue(store->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
+}
+
+TEST(TaskStoreTest, AnInvalidRecordAbortsTheWholeMerge)
+{
+    const std::unique_ptr<TaskStore> store = openStore(":memory:");
+    ASSERT_NE(nullptr, store);
+    const Task known = okValue(store->addTask(draftTask("untouched")), Task{}, "addTask");
+
+    // A readable file whose second record breaks a rule addTask enforces. The
+    // first record must not land either: the header promises no partial merge,
+    // and validating every record before the transaction opens is what makes
+    // that structural rather than a matter of careful bookkeeping.
+    const std::string jsonl =
+        liveRecord(newUid(), "valid and tempting", 1700000000, 1700000000) + "\n" +
+        liveRecord(newUid(), "invalid", 1700000001, 1700000001, "open", 9) + "\n";
+    const Result<MergeReport> merged = store->mergeJsonl(jsonl, false);
+    ASSERT_FALSE(merged.ok());
+    EXPECT_EQ(ErrorCode::kInvalidArgument, merged.error().code);
+    EXPECT_NE(std::string::npos, merged.error().message.find("importance"))
+        << "the error must name the rule that broke: " << merged.error().message;
+    EXPECT_NE(std::string::npos, merged.error().message.find("2"))
+        << "the error must name the offending record: " << merged.error().message;
+
+    const std::vector<Task> tasks = tasksByUid(*store);
+    ASSERT_EQ(1U, tasks.size());
+    EXPECT_EQ(known.uid, tasks.front().uid);
+    EXPECT_EQ(0U, okValue(store->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
+}
+
+TEST(TaskStoreTest, MergeReportExamplesAreCappedButCountsAreExact)
+{
+    const std::unique_ptr<TaskStore> store = openStore(":memory:");
+    ASSERT_NE(nullptr, store);
+
+    const std::size_t total = kMergeReportTitleLimit + 7;
+    std::string jsonl;
+    for (std::size_t index = 0; index < total; ++index) {
+        jsonl += liveRecord(newUid(), "task " + std::to_string(index), 1700000000, 1700000000);
+        jsonl += '\n';
+    }
+
+    const MergeReport report = okValue(store->mergeJsonl(jsonl, false), MergeReport{}, "mergeJsonl");
+    EXPECT_EQ(total, report.inserted) << "the counts must stay exact when the examples are capped";
+    EXPECT_EQ(kMergeReportTitleLimit, report.inserted_titles.size())
+        << "a first sync of a large file must not turn the report into the file again";
+    EXPECT_EQ(total, tasksByUid(*store).size());
+}
+
+TEST(TaskStoreTest, MergeReportSerializesWithStableKeys)
+{
+    MergeReport report;
+    report.inserted = 2;
+    report.updated = 1;
+    report.deleted = 3;
+    report.resurrected = 4;
+    report.skipped = 5;
+    report.inserted_titles = { "a", "b" };
+    report.deleted_titles = { "gone" };
+
+    const nlohmann::json json = toJson(report);
+    EXPECT_EQ(2, json.at("inserted").get<int>());
+    EXPECT_EQ(1, json.at("updated").get<int>());
+    EXPECT_EQ(3, json.at("deleted").get<int>());
+    EXPECT_EQ(4, json.at("resurrected").get<int>());
+    EXPECT_EQ(5, json.at("skipped").get<int>());
+    EXPECT_EQ(2U, json.at("inserted_titles").size());
+    EXPECT_EQ(1U, json.at("deleted_titles").size());
+    EXPECT_TRUE(json.at("updated_titles").empty());
+    EXPECT_TRUE(json.at("resurrected_titles").empty());
+    EXPECT_FALSE(json.at("clean").get<bool>());
+    EXPECT_EQ(10U, json.size()); // five counts, four title lists, and clean
+
+    // A report with nothing to do is the common case (a no-op sync), and it
+    // says so in both places a caller might look.
+    const MergeReport quiet;
+    EXPECT_TRUE(quiet.clean());
+    EXPECT_TRUE(toJson(quiet).at("clean").get<bool>());
 }
 
 // ---------------------------------------------------------------------------

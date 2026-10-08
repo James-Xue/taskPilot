@@ -13,15 +13,18 @@ include(GoogleTest)
 add_executable(taskpilot_tests
     unit/test_result.cpp
     unit/test_task.cpp
+    unit/test_uuid.cpp
     unit/test_weights.cpp
     unit/test_priority_engine.cpp
     unit/test_task_store.cpp
+    unit/test_task_sync.cpp
     unit/test_services.cpp
     unit/test_mcp_server.cpp
     unit/test_json_rpc_server.cpp
     unit/test_repl.cpp
     unit/test_control_client.cpp
     integration/test_daemon_roundtrip.cpp
+    integration/test_two_machine_sync.cpp
 )
 
 target_link_libraries(taskpilot_tests

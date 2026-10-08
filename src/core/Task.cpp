@@ -94,6 +94,10 @@ std::optional<TaskStatus> taskStatusFromString(const std::string &text)
 // optional key would make "no deadline" indistinguishable from "this server
 // does not report deadlines".
 //
+// `uid` is a plain string rather than an optional, so a task the store has
+// not saved yet is emitted as "" — present and readable like every other key,
+// and distinguishable from a real uuid rather than absent.
+//
 // Key order is not significant: nlohmann::json's default object type is
 // std::map, so the emitted document is key-sorted regardless of the order the
 // assignments below appear in.
@@ -101,9 +105,17 @@ nlohmann::json toJson(const Task &task)
 {
     nlohmann::json out;
 
-    // Identity and text fields, copied verbatim. Notes is emitted even when
-    // empty for the same stable-schema reason as the nullable fields below.
+    // The two identities, assigned side by side here even though the
+    // key-sorted output will not show them that way. `uid` is which task this
+    // is on every machine; `id` is only this database's row number (see the
+    // field comments in Task.hpp). Anything matching two machines' tasks must
+    // use uid — matching on id silently pairs two unrelated "row 9"s, which
+    // is the data loss the uid field exists to prevent.
+    out["uid"] = task.uid;
     out["id"] = task.id;
+
+    // Text fields, copied verbatim. Notes is emitted even when empty for the
+    // same stable-schema reason as the nullable fields below.
     out["title"] = task.title;
     out["notes"] = task.notes;
 

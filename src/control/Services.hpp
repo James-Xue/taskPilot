@@ -61,7 +61,8 @@ class Services
     Services(TaskStore &store, const Clock &clock, std::string version);
 
     /// The complete method catalog, in a stable display order (introspection
-    /// first, then task mutations, then queries, then settings).
+    /// first, then task mutations, then queries, then synchronisation, then
+    /// settings).
     ///
     /// Static because it is pure data: the `mcp` subcommand calls it without
     /// constructing a Services (it has no store — it talks to the daemon).
@@ -112,6 +113,10 @@ class Services
     [[nodiscard]] RpcResult handleListTasks(const nlohmann::json &params);
     [[nodiscard]] RpcResult handleGetTask(const nlohmann::json &params);
     [[nodiscard]] RpcResult handleGetStats(const nlohmann::json &params);
+
+    // --- synchronisation ---
+    [[nodiscard]] RpcResult handleExportTasks(const nlohmann::json &params);
+    [[nodiscard]] RpcResult handleImportTasks(const nlohmann::json &params);
 
     // --- settings ---
     [[nodiscard]] RpcResult handleGetWeights(const nlohmann::json &params);

@@ -31,6 +31,7 @@
 
 #include "core/PriorityEngine.hpp"
 #include "core/Task.hpp"
+#include "core/TaskSync.hpp"
 #include "core/Weights.hpp"
 
 namespace taskpilot
@@ -330,15 +331,16 @@ const std::vector<MethodSpec> &Services::methodSpecs()
     // thread-safe, so concurrent readers need no lock of their own.
     static const std::vector<MethodSpec> kSpecs = [] {
         std::vector<MethodSpec> specs;
-        specs.reserve(13);
+        specs.reserve(15);
 
         // --- introspection ---
         specs.push_back(MethodSpec{
             "get_status",
             "Report the daemon: version, uptime, database path, method count and the "
             "backlog tallies (open, in_progress, done, archived, overdue, "
-            "due_within_24h). Call it to check that the daemon is alive and to see how "
-            "much work is outstanding before deciding what to do.",
+            "due_within_24h, and tombstones, the records of deletions that a merge "
+            "from another machine must not undo). Call it to check that the daemon is "
+            "alive and to see how much work is outstanding before deciding what to do.",
             objectSchema(nlohmann::json::object(), {}) });
 
         specs.push_back(MethodSpec{
@@ -495,6 +497,48 @@ const std::vector<MethodSpec> &Services::methodSpecs()
             "when you want the ranked list itself.",
             objectSchema(nlohmann::json::object(), {}) });
 
+        // --- synchronisation ---
+        //
+        // The backlog is shared between machines through a file that travels in
+        // git, so these are its two ends: export produces the file this machine
+        // would commit, import folds in the file another machine committed.
+        // They sit here rather than among the task mutations because one only
+        // reads, and because the other is the sole call in the API that can
+        // destroy local work — which is why only its destructive form is opt-in.
+
+        specs.push_back(MethodSpec{
+            "export_tasks",
+            "Return this machine's entire backlog as one JSONL document: every task "
+            "and every record of a deletion, one JSON record per line, sorted by uid, "
+            "plus its record count and format version. Use it to produce the "
+            "synchronisation file, which belongs in the PRIVATE data repository and "
+            "never in this public project one, and to see what this machine would "
+            "contribute to a merge. The whole backlog fits in the reply, so there is "
+            "nothing to page.",
+            objectSchema(nlohmann::json::object(), {}) });
+
+        specs.push_back(MethodSpec{
+            "import_tasks",
+            "Merge a backlog produced by export_tasks on another machine into this "
+            "one and report what changed: how many records were inserted, updated, "
+            "deleted, resurrected and skipped, with example titles. Records are "
+            "matched by uid, not by id, and the newer record wins, so an older copy "
+            "elsewhere cannot undo a deletion made here. IT IS A DRY RUN UNLESS YOU "
+            "ASK OTHERWISE: dry_run defaults to true and nothing is written unless "
+            "you pass dry_run false. Call it once to preview, read the report, then "
+            "call it again with dry_run false to apply it.",
+            objectSchema(
+                nlohmann::json{
+                    { "jsonl",
+                      stringProp("The whole backlog to merge, one JSON record per line, "
+                                 "exactly as export_tasks returned it. Required.") },
+                    { "dry_run",
+                      booleanProp("Whether to report the merge without performing it. "
+                                  "Defaults to true, so omit it to preview and pass "
+                                  "false to apply.") },
+                },
+                { "jsonl" }) });
+
         // --- settings ---
         specs.push_back(MethodSpec{
             "get_weights",
@@ -627,6 +671,19 @@ RpcResult Services::handleGetStatus(const nlohmann::json &params)
     // they are written FIRST so that the identity fields below can never be
     // shadowed by a future stats key of the same name.
     nlohmann::json result = toJson(stats.value());
+
+    // Tombstones are reported beside the task tallies because the two are read
+    // together: the task counts say what is here, and the tombstone count says
+    // how much was deliberately removed and must stay removed. It is also the
+    // cheapest sanity signal that a merge has not rewritten history — a
+    // tombstone count only ever grows (see TaskStore::tombstoneCount).
+    const Result<std::size_t> tombstones = m_store.tombstoneCount();
+    if (!tombstones.ok())
+    {
+        return tombstones.error();
+    }
+    result["tombstones"] = tombstones.value();
+
     result["version"] = m_version;
     result["uptime_seconds"] = now > m_startedAt ? now - m_startedAt : 0;
     result["db_path"] = m_store.path();
@@ -1196,6 +1253,92 @@ RpcResult Services::handleGetStats(const nlohmann::json &params)
     return result;
 }
 
+// --- synchronisation ----------------------------------------------------
+
+RpcResult Services::handleExportTasks(const nlohmann::json &params)
+{
+    static_cast<void>(params); // Takes no parameters.
+
+    const Result<std::string> jsonl = m_store.exportJsonl();
+    if (!jsonl.ok())
+    {
+        return jsonl.error();
+    }
+
+    // The count is taken from the parser the importer uses rather than from a
+    // line count of our own, so the file the caller commits and the merge that
+    // will later read it agree by construction about how many records it
+    // holds. It also means a line our own parser would reject fails the export
+    // here, instead of being committed on this machine as a file the other one
+    // cannot read.
+    const Result<std::vector<SyncRecord>> records = parseJsonl(jsonl.value());
+    if (!records.ok())
+    {
+        return records.error();
+    }
+
+    // One reply carries the whole backlog: at this scale (a personal backlog,
+    // thousands of lines at most) that is no burden, and it is the point — the
+    // document is one file with one line per uid, so paging it would hand back
+    // something the caller still had to reassemble before committing it.
+    // `jsonl` IS that file's contents, which is what makes this the endpoint a
+    // client calls to produce the file it commits to the data repository.
+    return nlohmann::json{
+        { "format", kExportFormatVersion },
+        { "count", records.value().size() },
+        { "jsonl", jsonl.value() },
+    };
+}
+
+RpcResult Services::handleImportTasks(const nlohmann::json &params)
+{
+    const Result<std::string> jsonl = requiredString(params, "jsonl");
+    if (!jsonl.ok())
+    {
+        return jsonl.error();
+    }
+
+    // A merge can overwrite and remove local work, so it is the one operation
+    // here whose destructive form has to be ASKED FOR: the default is the dry
+    // run, and a caller that forgets the flag previews rather than applies.
+    // The catalog description says the same thing, because the description is
+    // what an LLM reads when it chooses how to call this.
+    //
+    // An explicit null means "no opinion" rather than "false" — the same
+    // normalisation the MCP transport applies to a null `arguments` — so the
+    // conservative default survives every way of leaving the flag out.
+    bool dryRun = true;
+    if (params.contains("dry_run") && !params.at("dry_run").is_null())
+    {
+        if (const Status read = optionalBool(params, "dry_run", dryRun); !read.ok())
+        {
+            return read.error();
+        }
+    }
+
+    const Result<MergeReport> report = m_store.mergeJsonl(jsonl.value(), dryRun);
+    if (!report.ok())
+    {
+        return report.error();
+    }
+
+    // The counts are identical whether or not anything was written, so the
+    // reply states which of the two happened: without this key a caller that
+    // omitted dry_run could not tell a preview from an applied merge, and
+    // would be left believing that a merge it never asked for had run.
+    nlohmann::json result = toJson(report.value());
+    // The report is an object by contract, and the check is what keeps a break
+    // in that contract a described failure: indexing a non-object throws, and
+    // an exception from a handler would reach the client as a protocol fault
+    // with no hint that the report was the thing that was malformed.
+    if (!result.is_object())
+    {
+        return Error::internal("the merge report did not serialize as an object");
+    }
+    result["dry_run"] = dryRun;
+    return result;
+}
+
 // --- settings -----------------------------------------------------------
 
 RpcResult Services::handleGetWeights(const nlohmann::json &params)
@@ -1253,6 +1396,8 @@ RpcResult Services::invoke(const std::string &method, const nlohmann::json &para
         { "list_tasks", &Services::handleListTasks },
         { "get_task", &Services::handleGetTask },
         { "get_stats", &Services::handleGetStats },
+        { "export_tasks", &Services::handleExportTasks },
+        { "import_tasks", &Services::handleImportTasks },
         { "get_weights", &Services::handleGetWeights },
         { "set_weights", &Services::handleSetWeights },
     };

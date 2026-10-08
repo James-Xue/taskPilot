@@ -46,7 +46,20 @@ enum class TaskStatus
 ///   - tags         : free-form labels for filtering.
 struct Task
 {
-    std::int64_t id{ 0 }; ///< 0 until the store assigns one.
+    /// Cross-machine identity: a v4 uuid assigned once by the store and never
+    /// changed. This — not `id` — is what an export carries and what a merge
+    /// matches on.
+    ///
+    /// It exists because `id` cannot survive synchronisation: AUTOINCREMENT
+    /// means "the ninth row THIS database created", so two machines that have
+    /// each made nine tasks both have a row 9, and a merge cannot tell them
+    /// apart. Empty only on a task that has not been stored yet.
+    std::string uid;
+
+    std::int64_t id{ 0 }; ///< Local row number. 0 until the store assigns one.
+                          ///< Meaningless on another machine (see `uid`), which
+                          ///< is why it is never written to an export.
+
     std::string title;    ///< Required, non-empty after trimming.
     std::string notes;    ///< Free-form detail; may be empty.
 
@@ -77,7 +90,10 @@ struct Task
 [[nodiscard]] std::optional<TaskStatus> taskStatusFromString(const std::string &text);
 
 /// Serialize a task. `due_at`/`completed_at` are emitted as null when unset
-/// so clients see a stable schema instead of a missing key.
+/// so clients see a stable schema instead of a missing key; `uid` is always
+/// present, because it is the only field that identifies the same task on two
+/// machines. `id` is included as well, but as a local convenience only — see
+/// the field comment for why it must never be used to match across machines.
 [[nodiscard]] nlohmann::json toJson(const Task &task);
 
 /// Tags round-trip through SQLite as a JSON array in a TEXT column. Using

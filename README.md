@@ -12,6 +12,11 @@ LLM can add tasks, rank them, and close them out without a UI in the way.
 There are no projects, no subtasks, no dependency graph, and no notifications.
 `blocks` is a number you supply, not a graph the tool maintains.
 
+Several machines can share one backlog: taskPilot exports the whole list as
+JSONL and merges an export back in, so the file can live in a private git
+repository and be reconciled line by line. See
+**[docs/sync.md](docs/sync.md)**.
+
 ---
 
 ## Quickstart (60 seconds)
@@ -150,19 +155,26 @@ Full specification, term-by-term rationale, and the worked example:
 | `./run.sh serve` | Opens the store, applies the schema, binds the control socket, serves JSON-RPC. | One per control port. A second one fails to bind and says so. |
 | `./run.sh mcp` | stdio MCP bridge. | Owns no store; forwards every call to the daemon. Spawned by the MCP host. |
 | `./run.sh cli` | Interactive REPL attached to a running daemon. | Commands: `queue`, `ls`, `add`, `show`, `done`, `reopen`, `rm`, `weights`, `stats`, `status`, `methods`, `help`, `quit`. |
+| `./run.sh export [--out <path>]` | Writes the whole backlog as one JSONL document. | Needs the daemon. Without `--out`, prints to stdout; with it, writes the file (creating parent directories) and reports the record count on stderr. |
+| `./run.sh import [--file <path>] [--apply]` | Merges a JSONL export back into the backlog. | Needs the daemon. **Dry run by default** — without `--apply` it only reports what would change. Reads `--file`, or stdin when omitted. Exits 2 on a usage error. |
 | `./run.sh version` | Prints the version. | Exits immediately. |
 | `./run.sh build [--clean]` | Configure and compile. | `--clean` removes the build directory first. |
 | `./run.sh test` | Build, then run the test suite. | `ctest --output-on-failure`. |
 | `./run.sh clean` | Remove the build directory. | Does not touch `data/`. |
 
-The subcommands pass the rest of the command line through to the binary, which
-takes three flags. Each has an environment fallback, and the flag wins:
+The subcommands pass the rest of the command line through to the binary. Three
+flags configure the store and the socket; each has an environment fallback, and
+the flag wins:
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
 | `--db <path>` | `TASKPILOT_DB` | `data/taskpilot.db` | The SQLite file to open (`serve` only). `run.sh` exports the default itself. |
 | `--port <n>` | `TASKPILOT_PORT` | `8091` | Control socket port, 1..65535. |
-| `--bind <addr>` | `TASKPILOT_BIND` | `127.0.0.1` | Bind address for `serve`; connect address for `mcp` and `cli`. |
+| `--bind <addr>` | `TASKPILOT_BIND` | `127.0.0.1` | Bind address for `serve`; connect address for `mcp`, `cli`, `export` and `import`. |
+
+`export` and `import` add their own flags — `--out <path>`, `--file <path>`,
+`--apply` — which belong to those subcommands alone and have no environment
+fallback.
 
 So `./run.sh serve --port 9000 --db /tmp/backlog.db` is a second backlog on its
 own port, and `./run.sh cli --port 9000` attaches to it.
@@ -174,6 +186,47 @@ an absolute `YYYY-MM-DD`.
 `serve` and `mcp` are **the same executable**. That is deliberate: the tool list
 the MCP host sees and the daemon answering the calls are compiled from one
 `Services::methodSpecs()` catalog, so a rebuild can never leave them disagreeing.
+`export` and `import` are subcommands of that same binary; `run.sh` forwards
+them like the rest.
+
+## Syncing across machines
+
+One backlog can live on several machines. The database file stays local — it is
+personal data and this repository is public — so what travels is a **JSONL
+export** (one record per line) committed to a separate, **private** repository,
+conventionally `taskPilot-data`. Git can then merge two machines' files line by
+line; identity is a `uid` on every task, because the integer `id` means "the
+ninth row *this* database created" and is not portable.
+
+```bash
+cd ~/1_Code/02_taskPilot
+DATA=~/1_Code/taskPilot-data
+
+git -C "$DATA" pull                                   # the other machine's records
+./run.sh import --file "$DATA/backlog.jsonl"          # dry run: what would change
+./run.sh import --file "$DATA/backlog.jsonl" --apply  # apply it
+./run.sh export --out "$DATA/backlog.jsonl"           # this machine's merged state
+git -C "$DATA" add backlog.jsonl && git -C "$DATA" commit -m sync && git -C "$DATA" push
+```
+
+`import` **defaults to a dry run** and only reports what a merge would change;
+the merge happens with `--apply`. That default is deliberate — a merge can
+overwrite or delete tasks, so the destructive form has to be asked for. Both
+commands need the daemon running, because they go through the control socket
+like `cli` and `mcp`: the daemon stays the single writer of the database.
+
+Two rules worth knowing before the first sync:
+
+- **The local `id` is not portable.** `done 7` and a queue's ids mean "row 7 on
+  this machine"; the same task has a different id on the other one. `uid` is the
+  identity, and it is what an export carries.
+- **Pull before you push.** The export is a snapshot of your database, not a
+  diff, so a file exported before the other machine's records were merged omits
+  them. Order: pull, import, export, push.
+
+Full specification — the record format field by field, the four properties that
+make the file mergeable, the complete merge decision table with tombstones, and
+the conflict case: **[docs/sync.md](docs/sync.md)**.
 
 ## Requirements
 
@@ -190,7 +243,10 @@ the MCP host sees and the daemon answering the calls are compiled from one
 ## Where the data lives
 
 One SQLite file, `data/taskpilot.db` by default (`TASKPILOT_DB` overrides it).
-Two tables: `tasks` and `settings`. Copying that file is a complete backup.
+Three tables: `tasks` (each row carrying both a local `id` and the
+cross-machine `uid`), `tombstones` (one row per deleted task, so a deletion can
+travel to another machine — see [docs/sync.md](docs/sync.md)), and `settings`
+(the ranking weights). Copying that file is a complete backup.
 It is gitignored, and it should stay that way — it is personal backlog content,
 not source.
 
@@ -217,7 +273,9 @@ SQLite and back, the threading model, and the database schema:
 - **No recurring tasks, reminders, or notifications.** It ranks; it does not
   nag.
 - **No undo**, except for the one thing that matters: `complete_task` keeps the
-  record and `reopen_task` brings it back. `delete_task` is permanent.
+  record and `reopen_task` brings it back. `delete_task` is permanent on this
+  machine — the one thing that can bring a task back is a *strictly newer* edit
+  made on another machine after the delete (see [docs/sync.md](docs/sync.md)).
 
 ## License
 

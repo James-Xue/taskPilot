@@ -84,3 +84,7 @@ compile_commands.json
 data/*.db
 data/*.db-shm
 data/*.db-wal
+
+# A local export is personal data (work items, deadlines) and this repo is
+# public. The sync target lives in the separate private taskPilot-data repo.
+export/

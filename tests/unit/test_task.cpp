@@ -8,6 +8,11 @@
 //
 // The comma case is here to keep the JSON encoding honest — it is precisely
 // the input a delimiter-joined column would have mangled.
+//
+// The uid/id cases pin the one distinction the wire format must never
+// collapse: `id` is this database's row number and `uid` is the task's
+// identity everywhere. Serializing them as separate keys of different JSON
+// types is what stops a client from matching on the wrong one.
 
 #include <gtest/gtest.h>
 
@@ -24,10 +29,13 @@ namespace
 {
 
 // A fully populated task in a non-default state, so toJson is exercised on
-// something other than the zero-value struct.
+// something other than the zero-value struct. The uid is a well-formed v4
+// uuid, because a stored task always carries one: the store assigns it at
+// insert time, so this is what a real serialized task looks like.
 taskpilot::Task makeTask()
 {
     taskpilot::Task task;
+    task.uid = "9f3c1a2b-4d5e-4f60-8a9b-0c1d2e3f4a5b";
     task.id = 7;
     task.title = "Fix the reconnect bug";
     task.notes = "Two sockets drift after a short outage.";
@@ -105,6 +113,7 @@ TEST(TaskJsonTest, EmitsEveryFieldWithNullForAbsentTimestamps)
     const taskpilot::Task task = makeTask();
 
     const nlohmann::json expected = nlohmann::json::parse(R"({
+        "uid": "9f3c1a2b-4d5e-4f60-8a9b-0c1d2e3f4a5b",
         "id": 7,
         "title": "Fix the reconnect bug",
         "notes": "Two sockets drift after a short outage.",
@@ -120,7 +129,10 @@ TEST(TaskJsonTest, EmitsEveryFieldWithNullForAbsentTimestamps)
 
     // Comparing whole documents pins the key set as well as the values: a
     // dropped key or an extra one fails here, which is the entire point of
-    // promising clients a stable schema.
+    // promising clients a stable schema. The cost is that adding a field to
+    // Task.cpp (as uid was added) breaks this test until the literal is
+    // extended deliberately — and that is the feature, not the friction: a
+    // schema change that no reviewer sees is exactly what must not happen.
     EXPECT_EQ(expected, taskpilot::toJson(task));
 }
 
@@ -160,6 +172,57 @@ TEST(TaskJsonTest, DefaultsSurviveTheTrip)
     EXPECT_EQ(std::int64_t{ 0 }, document.at("created_at").get<std::int64_t>());
     EXPECT_EQ(std::int64_t{ 0 }, document.at("updated_at").get<std::int64_t>());
     EXPECT_EQ(std::string(""), document.at("notes").get<std::string>());
+}
+
+TEST(TaskJsonTest, UnstoredTaskReportsAnEmptyUid)
+{
+    // uid is assigned by the store at insert time, so a task that has never
+    // been saved legitimately has none. The key still exists and holds "" —
+    // not null, not an absent key — because uid is a plain string everywhere
+    // else and a client must be able to read it unconditionally. An empty
+    // value cannot pass for an identity: the export parser's uuid shape check
+    // rejects it, so an unstored task can never be matched or merged.
+    const taskpilot::Task task;
+    const nlohmann::json document = taskpilot::toJson(task);
+
+    ASSERT_TRUE(document.contains("uid"));
+    ASSERT_TRUE(document.at("uid").is_string());
+    EXPECT_EQ(std::string(""), document.at("uid").get<std::string>());
+}
+
+TEST(TaskJsonTest, UidAndIdAreSeparateIdentities)
+{
+    // This pins why uid exists at all. `id` is a local row number, so two
+    // machines that have each saved nine tasks both hold a row 9 and a merge
+    // cannot tell them apart. Serialization therefore has to keep the two
+    // identities under their own keys, each carrying its own field, and with
+    // values of different JSON types (uuid string vs. integer row number) so
+    // that reaching for the wrong one is a visible type error rather than a
+    // plausible-looking match that silently pairs unrelated tasks.
+    taskpilot::Task first = makeTask();
+    first.uid = "9f3c1a2b-4d5e-4f60-8a9b-0c1d2e3f4a5b";
+    first.id = 9;
+
+    const nlohmann::json document = taskpilot::toJson(first);
+
+    ASSERT_TRUE(document.contains("uid"));
+    ASSERT_TRUE(document.contains("id"));
+    EXPECT_TRUE(document.at("uid").is_string());
+    EXPECT_TRUE(document.at("id").is_number_integer());
+
+    // Neither key is an alias for the other: each reports its own field.
+    EXPECT_EQ(first.uid, document.at("uid").get<std::string>());
+    EXPECT_EQ(first.id, document.at("id").get<std::int64_t>());
+
+    // The case the split exists for, made concrete: two tasks sharing a local
+    // row number are still distinguishable documents, because only uid
+    // travels between machines.
+    taskpilot::Task second = first;
+    second.uid = "0a1b2c3d-4e5f-4a6b-8c7d-8e9f0a1b2c3d";
+    const nlohmann::json other = taskpilot::toJson(second);
+
+    EXPECT_EQ(document.at("id"), other.at("id"));
+    EXPECT_NE(document.at("uid"), other.at("uid"));
 }
 
 TEST(TaskJsonTest, SetTimestampsAppearAsNumbers)

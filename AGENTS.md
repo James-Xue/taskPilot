@@ -22,7 +22,8 @@ L2 control   Services (catalog + handlers)  JsonRpcServer  ControlClient
              McpServer  Repl
                  |
                  v   depends on (never the reverse)
-L1 core      Task  Weights  PriorityEngine  TaskStore (SQLite)  Result/Error  Clock
+L1 core      Task  Weights  PriorityEngine  TaskStore (SQLite)  TaskSync
+             Uuid  Result/Error  Clock
 ```
 
 **Key property**: the ranking math is pure and the daemon is the only writer.
@@ -34,6 +35,23 @@ about ranking, JSON-RPC, or MCP.
 **Second key property**: there is exactly one binary. `serve` (the daemon) and
 `mcp` (the stdio bridge) are the same executable, so the tool list the MCP host
 sees can never be from a different version than the daemon answering it.
+
+**Identity rule**: a task has two identities and they are not interchangeable.
+`uid` — a version-4 uuid, assigned once by the store and never changed — is the
+**cross-machine** identity: it is what an export carries and what a merge
+matches on. `id` (`INTEGER AUTOINCREMENT`) is a **local row number** — *"the
+ninth row this database created"* — so two machines both have a task 9, and the
+same task has a different number on each. Use `id` for this machine's REPL and
+control calls (`done 7`), `uid` for anything that crosses machines. No export
+carries `id`, deliberately: a transported integer id invites a reader to match
+on it, which is the bug the uuid exists to prevent.
+
+**Cross-machine sync**: the backlog travels as a JSONL export — one record per
+line, sorted by uid, deletions kept as tombstones — committed to a separate
+**private** data repository (`taskPilot-data`), and merged back in with
+last-write-wins over the record's stamp. `TaskSync` holds the format and the
+complete decision table as pure code (no database, no clock); `TaskStore`
+applies it inside one transaction. The specification is `docs/sync.md`.
 
 ---
 
@@ -95,6 +113,8 @@ has to create it.
 | `./run.sh serve` | The daemon: opens the store, applies the schema, binds the control socket, serves JSON-RPC. Default when no subcommand is given. | long-lived |
 | `./run.sh mcp` | stdio MCP bridge. Owns no store; forwards every `tools/call` to the daemon through `ControlClient`. | one per MCP host session |
 | `./run.sh cli` | Interactive REPL over the control socket. | as long as you keep it open |
+| `./run.sh export [--out <path>]` | Write the whole backlog as JSONL — stdout by default, or a file with `--out`. Goes through the control socket like `cli`/`mcp`, so the daemon must be running. | one shot |
+| `./run.sh import [--file <path>] [--apply]` | Merge a JSONL export (file, or stdin) into the backlog. **Dry run unless `--apply` is given.** Also through the control socket. | one shot |
 | `./run.sh version` | Print the version. | one shot |
 | `./run.sh build [--clean]` / `test` / `clean` | Build helpers in `run.sh`; not subcommands of the binary. | — |
 
@@ -238,11 +258,13 @@ skim past the ones that matter.
 
 Two layers, one direction of dependency.
 
-- **L1 `core`** — `Task`, `Weights`, `PriorityEngine`, `TaskStore`, `Result`,
-  `Clock`. It knows nothing about sockets, JSON-RPC, MCP, or the daemon.
-  Concretely: `TaskStore` does not rank and does not know what a "queue" is
-  (it returns an unordered set); `PriorityEngine` does not store and does not
-  read the clock (it takes `now` as a parameter).
+- **L1 `core`** — `Task`, `Weights`, `PriorityEngine`, `TaskStore`, `TaskSync`,
+  `Uuid`, `Result`, `Clock`. It knows nothing about sockets, JSON-RPC, MCP, or
+  the daemon. Concretely: `TaskStore` does not rank and does not know what a
+  "queue" is (it returns an unordered set); `PriorityEngine` does not store and
+  does not read the clock (it takes `now` as a parameter); `TaskSync` is pure —
+  no database, no clock, no I/O — so the whole merge decision table is testable
+  without a store.
 - **L2 `control`** — `Services` (the API surface), `JsonRpcServer` (the daemon's
   socket), `ControlClient`, `McpServer` (the stdio bridge), `Repl`.
 
@@ -261,6 +283,11 @@ When adding a capability, ask which layer owns it:
   Rule #2).
 - A transport concern (framing, timeouts, protocol versions) -> the transport
   file, never `Services`.
+- A change to the export format or the merge rule -> `core/TaskSync.cpp`, plus
+  `docs/sync.md` and a decision-table test. The format is a contract between two
+  machines that are never updated at the same moment, so a change must either
+  keep an older reader safe or bump `v` — and an older reader then refuses the
+  file instead of misreading it.
 
 ---
 
@@ -311,6 +338,11 @@ When adding a capability, ask which layer owns it:
 9. **Don't throw for an expected failure.** Not-found, invalid input, and I/O
    faults are `Error` values; a throw across the RPC boundary would be an
    unhandled exception in the daemon, not an error the caller can read.
+10. **Don't commit an export into this repository.** The JSONL export is the
+    whole backlog — titles, notes, deadlines, all personal data — and this
+    repository is **public**. The sync target is a separate, private data
+    repository (`taskPilot-data`); `.gitignore` covers `export/` as a backstop
+    for a stray local file, not as a place for it to live. See `docs/sync.md`.
 
 ## Binding and Auth
 
@@ -334,6 +366,7 @@ should stay that way. It is personal backlog content, not source.
 | `docs/architecture.md` | Layers, process model, the data flow of one tool call, threading, schema. |
 | `docs/mcp.md` | The MCP contract: both protocol eras, version lists, error codes, tools. |
 | `docs/scoring.md` | **The scoring specification.** If the code and this document disagree, the code is wrong. |
+| `docs/sync.md` | **The cross-machine sync specification.** The JSONL record format, the four properties that make the file mergeable, the merge decision table and its two asymmetries, tombstones, and the two-machine workflow. |
 
 When you change behaviour, update the document that describes it in the same
 commit. `docs/scoring.md` is the one document that is a specification rather than

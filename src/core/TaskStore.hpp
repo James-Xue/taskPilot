@@ -2,9 +2,24 @@
 // TaskStore.hpp — SQLite persistence for tasks and ranking weights
 //
 // Schema (created on first open; see TaskStore.cpp for the DDL):
-//   tasks(id, title, notes, status, importance, due_at, blocks, tags,
+//   tasks(id, uid, title, notes, status, importance, due_at, blocks, tags,
 //         created_at, updated_at, completed_at)
+//   tombstones(uid, deleted_at)   -- records of deletions, see below
 //   settings(key, value)          -- 'weights' (JSON), 'schema_version'
+//
+// Schema version 1 added `uid` and `tombstones`. open() migrates a version-0
+// database in place: it adds the column, backfills a uuid for every existing
+// row, and creates the table. The migration is idempotent, so a database that
+// has already been migrated (or one created fresh at version 1) is untouched.
+//
+// Why tombstones exist: without a record of a deletion, the deletion cannot
+// travel between machines. The other machine still has the task, exports it,
+// the merge sees a uid it does not know, inserts it — and the thing you
+// deliberately deleted comes back. So deleteTask removes the row from `tasks`
+// AND leaves a tombstone, and absence from one side is never read as evidence
+// of deletion. Tombstones are tiny and never expire; a uid that is gone is
+// gone, so there is nothing to garbage-collect and no window in which a
+// resurrection can slip through.
 //
 // Layering: this layer knows SQL and the Task struct. It does NOT rank, and
 // it does NOT know about JSON-RPC or MCP. Whatever comes out of listTasks is
@@ -79,6 +94,39 @@ struct Stats
     std::size_t due_within_24h{ 0 }; ///< Actionable, due_at in [now, now+1d).
 };
 
+/// What a merge did, or would do under `dry_run`.
+///
+/// The title lists exist for the dry run, which is the whole reason the report
+/// is not just counts: a merge is the one operation here that can destroy
+/// work, so a caller must be able to SEE which tasks are about to be
+/// overwritten or removed before agreeing to it. They are capped (see
+/// kMergeReportTitleLimit) so a first sync of a large file cannot turn into a
+/// multi-megabyte reply.
+struct MergeReport
+{
+    std::size_t inserted{ 0 };    ///< New uids created locally.
+    std::size_t updated{ 0 };     ///< Existing uids overwritten by a newer record.
+    std::size_t deleted{ 0 };     ///< Existing uids removed by a newer tombstone.
+    std::size_t resurrected{ 0 }; ///< Tombstoned uids brought back by a newer edit.
+    std::size_t skipped{ 0 };     ///< Records the local copy already won.
+
+    std::vector<std::string> inserted_titles;
+    std::vector<std::string> updated_titles;
+    std::vector<std::string> deleted_titles;
+    std::vector<std::string> resurrected_titles;
+
+    /// True when the merge did (or would) change nothing. A no-op sync is the
+    /// common case, and it should be distinguishable from a failure at a glance.
+    [[nodiscard]] bool clean() const
+    {
+        return 0 == (inserted + updated + deleted + resurrected);
+    }
+};
+
+/// How many titles each MergeReport list carries before it is truncated.
+/// The counts stay exact; only the examples are capped.
+inline constexpr std::size_t kMergeReportTitleLimit{ 50 };
+
 /// Owns the SQLite handle and every statement against it.
 class TaskStore
 {
@@ -98,10 +146,11 @@ class TaskStore
     TaskStore(TaskStore &&) = delete;
     TaskStore &operator=(TaskStore &&) = delete;
 
-    /// Insert a task. The store assigns id, created_at and updated_at —
+    /// Insert a task. The store assigns uid, id, created_at and updated_at —
     /// whatever the caller put in those fields is overwritten, so a client
-    /// cannot forge history. `completed_at` is set when the incoming status
-    /// is kDone.
+    /// cannot forge history or, worse, choose its own uid and collide with a
+    /// task arriving from another machine. `completed_at` is set when the
+    /// incoming status is kDone.
     ///
     /// Validation (shared by every write path, so no caller can bypass it):
     /// 1. title, after trimming surrounding whitespace, must be non-empty.
@@ -124,9 +173,51 @@ class TaskStore
     /// updated_at is always refreshed. Validation matches addTask.
     [[nodiscard]] Result<Task> updateTask(std::int64_t id, const TaskPatch &patch);
 
-    /// Permanently remove a task. kNotFound if it was already gone — a delete
-    /// that silently succeeds on a missing row hides double-delete bugs.
+    /// Remove a task, leaving a tombstone so the deletion can travel to other
+    /// machines (see the tombstones note in this file's header). kNotFound if
+    /// it was already gone — a delete that silently succeeds on a missing row
+    /// hides double-delete bugs.
+    ///
+    /// A task that is already tombstoned is reported as kNotFound even though
+    /// a tombstone for its uid exists: from a caller's point of view "it is
+    /// gone" is the truth, and the tombstone is bookkeeping, not a task.
     [[nodiscard]] Status deleteTask(std::int64_t id);
+
+    /// Export every task and every tombstone as JSONL sorted by uid — this
+    /// machine's complete backlog state, in the format TaskSync.hpp documents.
+    ///
+    /// One record per uid, sorted, is not cosmetic: it is what lets git merge
+    /// two machines' exports line by line instead of conflicting wholesale.
+    [[nodiscard]] Result<std::string> exportJsonl() const;
+
+    /// Merge an export into this store, or report what a merge would do.
+    ///
+    /// `dry_run` takes every decision and counts every outcome but writes
+    /// nothing, so its report is exactly what the same call with dry_run=false
+    /// would produce. A dry run is only worth trusting if that holds — see
+    /// tests/unit/test_task_store.cpp, which asserts the two agree.
+    ///
+    /// The whole merge is ONE transaction. Stopping halfway would leave the
+    /// backlog in a state that is neither the old one nor the new one, and the
+    /// next sync would treat that mixture as truth. A failure anywhere rolls
+    /// everything back and reports the first problem, rather than applying the
+    /// records that happened to parse.
+    ///
+    /// An unparseable line therefore fails the entire call with kInvalidArgument
+    /// naming the line number — there is no partial merge.
+    [[nodiscard]] Result<MergeReport> mergeJsonl(const std::string &jsonl,
+                                                 bool dry_run);
+
+    /// Fetch a task by its cross-machine uid. kNotFound if absent.
+    ///
+    /// The companion to getTask() for anything that arrived from another
+    /// machine, where the integer id means nothing.
+    [[nodiscard]] Result<Task> getTaskByUid(const std::string &uid) const;
+
+    /// Number of tombstones, for get_status. Exposed because a tombstone count
+    /// that only grows is the expected shape and a useful sanity signal — if it
+    /// ever drops, a merge has rewritten history.
+    [[nodiscard]] Result<std::size_t> tombstoneCount() const;
 
     /// Current ranking weights (from the settings table).
     [[nodiscard]] Result<Weights> weights() const;
@@ -177,5 +268,9 @@ class TaskStore
 
 /// Serialize stats for the wire.
 [[nodiscard]] nlohmann::json toJson(const Stats &stats);
+
+/// Serialize a merge report for the wire. Titles are included so a dry run can
+/// be reviewed; see MergeReport for why that matters.
+[[nodiscard]] nlohmann::json toJson(const MergeReport &report);
 
 } // namespace taskpilot

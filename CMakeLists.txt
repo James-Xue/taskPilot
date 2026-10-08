@@ -65,6 +65,8 @@ add_library(taskpilot_core STATIC
     src/core/Task.cpp
     src/core/Weights.cpp
     src/core/Clock.cpp
+    src/core/Uuid.cpp
+    src/core/TaskSync.cpp
     src/core/PriorityEngine.cpp
     src/core/TaskStore.cpp
 )

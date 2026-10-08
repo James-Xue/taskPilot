@@ -15,10 +15,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <ctime>
 #include <latch>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -33,6 +35,8 @@
 #include "core/PriorityEngine.hpp"
 #include "core/Task.hpp"
 #include "core/TaskStore.hpp"
+#include "core/TaskSync.hpp"
+#include "core/Uuid.hpp"
 #include "core/Weights.hpp"
 
 namespace taskpilot
@@ -165,7 +169,7 @@ TEST_F(ServicesTest, GetStatusReportsIdentityAndBacklog)
 
     EXPECT_EQ(status.at("version").get<std::string>(), kVersion);
     EXPECT_EQ(status.at("db_path").get<std::string>(), ":memory:");
-    EXPECT_EQ(status.at("method_count").get<int>(), 13);
+    EXPECT_EQ(status.at("method_count").get<int>(), 15);
     EXPECT_GE(status.at("uptime_seconds").get<std::int64_t>(), 0);
 
     // The store's tallies are merged at the top level of the reply, so the
@@ -188,7 +192,7 @@ TEST_F(ServicesTest, DescribeMethodsReturnsTheWholeCatalog)
     const nlohmann::json catalog = callOk(harness.services, "describe_methods");
 
     ASSERT_TRUE(catalog.is_array());
-    ASSERT_EQ(catalog.size(), 13U);
+    ASSERT_EQ(catalog.size(), 15U);
 
     std::vector<std::string> names;
     for (const nlohmann::json &entry : catalog)
@@ -836,6 +840,216 @@ TEST_F(ServicesTest, ConcurrentPartialWeightUpdatesKeepEveryKey)
         EXPECT_DOUBLE_EQ(stored.at(update.key).get<double>(), update.value)
             << update.key << " was lost to a concurrent partial update";
     }
+}
+
+// --- synchronisation ----------------------------------------------------
+//
+// The format itself is exercised in test_task_sync.cpp and the store's own
+// export/merge in test_task_store.cpp. What these tests protect is the API
+// above them: that the pair is in the catalog, that the export reply really is
+// a parsable document, and above all that a merge is never applied by accident.
+
+/// The whole backlog of a second, independent machine — its own store, its own
+/// clock — as the file its owner would commit.
+///
+/// Driven through export_tasks rather than hand-written JSONL so these tests
+/// cannot drift from what the exporter actually produces: a fixture written by
+/// hand would keep passing after a change to the format, which is the one
+/// thing synchronisation cannot survive.
+[[nodiscard]] std::string exportFromAnotherMachine(const std::vector<std::string> &titles)
+{
+    Harness other;
+    for (const std::string &title : titles)
+    {
+        addTask(other.services, title);
+    }
+    return callOk(other.services, "export_tasks").at("jsonl").get<std::string>();
+}
+
+TEST_F(ServicesTest, GetStatusReportsTombstones)
+{
+    addTask(harness.services, "kept");
+    const nlohmann::json thrownAway = addTask(harness.services, "thrown away");
+
+    // Zero rather than absent before any deletion, so a client can read the
+    // count without a key check.
+    EXPECT_EQ(callOk(harness.services, "get_status").at("tombstones").get<std::size_t>(), 0U);
+
+    callOk(harness.services, "delete_task", { { "id", thrownAway.at("id") } });
+
+    const nlohmann::json status = callOk(harness.services, "get_status");
+
+    // A tombstone is bookkeeping, not a task: the task tallies count what is
+    // here, and the deleted row is gone from them.
+    EXPECT_EQ(status.at("tombstones").get<std::size_t>(), 1U);
+    EXPECT_EQ(status.at("open").get<std::size_t>(), 1U);
+
+    // The same fact from the other end — the count of records a sync has to
+    // carry is one live task plus one tombstone.
+    EXPECT_EQ(callOk(harness.services, "export_tasks").at("count").get<std::size_t>(), 2U);
+}
+
+TEST_F(ServicesTest, ExportTasksReturnsOneParsableRecordPerLine)
+{
+    addTask(harness.services, "keep this one");
+    const nlohmann::json doomed = addTask(harness.services, "delete this one");
+    callOk(harness.services, "delete_task", { { "id", doomed.at("id") } });
+
+    const nlohmann::json exported = callOk(harness.services, "export_tasks");
+
+    EXPECT_EQ(exported.at("format").get<int>(), kExportFormatVersion);
+
+    const std::string jsonl = exported.at("jsonl").get<std::string>();
+    const Result<std::vector<SyncRecord>> parsed = parseJsonl(jsonl);
+    ASSERT_TRUE(parsed.ok()) << parsed.error().message;
+
+    // One live task and the tombstone of the other. The deletion has to travel:
+    // the machine that still holds the task would otherwise export it back and
+    // the merge would restore work that was deliberately removed.
+    ASSERT_EQ(parsed.value().size(), 2U);
+    EXPECT_EQ(exported.at("count").get<std::size_t>(), parsed.value().size());
+
+    std::size_t tombstones = 0;
+    for (const SyncRecord &record : parsed.value())
+    {
+        EXPECT_TRUE(looksLikeUuidV4(record.uid)) << record.uid;
+        if (record.deleted)
+        {
+            ++tombstones;
+            EXPECT_EQ(record.uid, doomed.at("uid").get<std::string>())
+                << "a tombstone must carry the uid of the task that was deleted, which "
+                   "is the only identity that means anything on the other machine";
+        }
+    }
+    EXPECT_EQ(tombstones, 1U);
+
+    // One record per line, and as many lines as the reply says there are
+    // records: the file's entire purpose is that git can merge two machines'
+    // exports line by line, which a record spanning lines would destroy.
+    std::size_t lines = 0;
+    std::istringstream stream(jsonl);
+    std::string line;
+    while (std::getline(stream, line))
+    {
+        if (line.empty())
+        {
+            continue;
+        }
+        ++lines;
+        const Result<SyncRecord> one = parseJsonLine(line);
+        EXPECT_TRUE(one.ok()) << "line " << lines << " does not parse: " << line;
+    }
+    EXPECT_EQ(lines, exported.at("count").get<std::size_t>());
+}
+
+TEST_F(ServicesTest, ImportTasksWithDryRunOmittedChangesNothing)
+{
+    const std::string incoming = exportFromAnotherMachine({ "invented over there" });
+    addTask(harness.services, "already here");
+    const std::size_t before =
+        callOk(harness.services, "get_status").at("open").get<std::size_t>();
+
+    const nlohmann::json report =
+        callOk(harness.services, "import_tasks", { { "jsonl", incoming } });
+
+    // A merge overwrites and removes local work, so omitting the flag must mean
+    // "show me what would happen". This is the assertion that fails the moment
+    // the default is flipped to destructive: the merge would leave two tasks
+    // where the caller expected one.
+    EXPECT_EQ(callOk(harness.services, "get_status").at("open").get<std::size_t>(), before);
+    ASSERT_EQ(callOk(harness.services, "list_tasks").size(), 1U);
+
+    // The report is not a placeholder, so the preview really took every
+    // decision instead of short-circuiting to an empty answer.
+    EXPECT_EQ(report.at("inserted").get<std::size_t>(), 1U);
+    EXPECT_TRUE(report.at("dry_run").get<bool>())
+        << "the reply must say which of the two happened: the counts are the same "
+           "either way, so a caller cannot infer it";
+
+    // An explicit null is how several clients spell "no opinion" (the MCP
+    // transport normalises a null `arguments` the same way), so it is treated
+    // as an absent key: still a dry run, and certainly not false.
+    nlohmann::json nulledParams{ { "jsonl", incoming } };
+    nulledParams["dry_run"] = nullptr;
+    const nlohmann::json nulled = callOk(harness.services, "import_tasks", nulledParams);
+
+    EXPECT_EQ(nulled.at("inserted").get<std::size_t>(), 1U);
+    EXPECT_TRUE(nulled.at("dry_run").get<bool>());
+    EXPECT_EQ(callOk(harness.services, "get_status").at("open").get<std::size_t>(), before);
+}
+
+TEST_F(ServicesTest, ImportTasksAppliesTheMergeOnlyWhenDryRunIsFalse)
+{
+    const std::string incoming = exportFromAnotherMachine({ "invented over there" });
+    const Result<std::vector<SyncRecord>> incomingRecords = parseJsonl(incoming);
+    ASSERT_TRUE(incomingRecords.ok()) << incomingRecords.error().message;
+    ASSERT_EQ(incomingRecords.value().size(), 1U);
+
+    const nlohmann::json report = callOk(
+        harness.services, "import_tasks", { { "jsonl", incoming }, { "dry_run", false } });
+
+    EXPECT_EQ(report.at("inserted").get<std::size_t>(), 1U);
+    EXPECT_FALSE(report.at("dry_run").get<bool>());
+
+    const nlohmann::json stored = callOk(harness.services, "list_tasks");
+    ASSERT_EQ(stored.size(), 1U);
+    EXPECT_EQ(stored.front().at("title").get<std::string>(), "invented over there");
+    // The task arrives with the uid it was given on the other machine: that,
+    // not the row number this store assigns it, is what identifies it, and the
+    // integer id it now has means nothing anywhere else.
+    EXPECT_EQ(stored.front().at("uid").get<std::string>(), incomingRecords.value().front().uid);
+
+    // Re-syncing the same file inserts nothing: a uid that is already here is
+    // what stops the next sync from making a second copy of the same task.
+    const nlohmann::json again = callOk(
+        harness.services, "import_tasks", { { "jsonl", incoming }, { "dry_run", false } });
+    EXPECT_EQ(again.at("inserted").get<std::size_t>(), 0U);
+    EXPECT_EQ(callOk(harness.services, "list_tasks").size(), 1U);
+}
+
+TEST_F(ServicesTest, ImportTasksRequiresAJsonlString)
+{
+    const Error missing = callError(harness.services, "import_tasks", nlohmann::json::object());
+    EXPECT_EQ(ErrorCode::kInvalidArgument, missing.code);
+    EXPECT_NE(std::string::npos, missing.message.find("jsonl"));
+
+    const Error wrongType = callError(harness.services, "import_tasks", { { "jsonl", 5 } });
+    EXPECT_EQ(ErrorCode::kInvalidArgument, wrongType.code);
+    EXPECT_NE(std::string::npos, wrongType.message.find("jsonl"));
+
+    // A wrongly typed flag is refused rather than quietly replaced by the
+    // default: a caller that asked for dry_run "yes" cannot tell a refused
+    // merge from an applied one, and the applied one cannot be undone.
+    const Error badFlag =
+        callError(harness.services, "import_tasks", { { "jsonl", "" }, { "dry_run", "yes" } });
+    EXPECT_EQ(ErrorCode::kInvalidArgument, badFlag.code);
+    EXPECT_NE(std::string::npos, badFlag.message.find("dry_run"));
+}
+
+TEST_F(ServicesTest, ImportTasksRefusesAFileItCannotReadEntirely)
+{
+    const std::string incoming = exportFromAnotherMachine({ "would have arrived" });
+    ASSERT_FALSE(incoming.empty());
+
+    // One readable record followed by a line no parser can accept (the uid is
+    // not a uuid). Merging the part that parsed would leave this machine in a
+    // state that is neither its old backlog nor the other machine's, and the
+    // next sync would treat that mixture as truth — so the whole call fails
+    // and nothing is written.
+    std::string damaged = incoming;
+    if ('\n' != damaged.back())
+    {
+        damaged.push_back('\n');
+    }
+    damaged += "{\"v\":1,\"uid\":\"not-a-uuid\",\"deleted\":true}\n";
+
+    const Error failure = callError(
+        harness.services, "import_tasks", { { "jsonl", damaged }, { "dry_run", false } });
+
+    EXPECT_EQ(ErrorCode::kInvalidArgument, failure.code);
+    EXPECT_TRUE(callOk(harness.services, "list_tasks").empty())
+        << "the records before the unreadable line must not have been applied";
+    EXPECT_EQ(callOk(harness.services, "get_status").at("open").get<std::size_t>(), 0U);
 }
 
 // --- parameter validation and dispatch ----------------------------------

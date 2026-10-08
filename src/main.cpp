@@ -1,6 +1,6 @@
 // main.cpp — the taskPilot executable: argument parsing, wiring, signal loop.
 //
-// One binary carries four subcommands so the daemon and the MCP bridge can
+// One binary carries six subcommands so the daemon and the MCP bridge can
 // never be different versions. That is not cosmetic: `mcp` forwards every
 // tools/call to a running `serve` and publishes a tool catalog that is
 // compiled into this file's own image, so a mismatched pair would advertise
@@ -11,14 +11,25 @@
 //            invoke the binary with no arguments)
 //   mcp      stdio MCP bridge; talks to a running daemon
 //   cli      interactive REPL; talks to a running daemon
+//   export   write every task and tombstone as JSONL, to stdout or --out
+//   import   merge a JSONL export into the daemon's store, dry run by default
 //   version  print the version
 //
-// Exit codes: 0 success, 1 runtime failure (store, socket, missing daemon),
-// 2 usage error (unknown command or flag, missing or out-of-range port). The
-// split matters because run.sh runs under `set -e`.
+// Four of the six are thin CLIENTS of the control socket (mcp, cli, export,
+// import): they do nothing with the backlog except ask the daemon to do it, so
+// the daemon stays its single writer and no second process ever opens the
+// database file. Only `serve` and `version` run with no daemon behind them —
+// which is why `export` and `import` fail when one is not listening.
 //
-// STDOUT POLICY: stdout carries a PRODUCT, never a diagnostic. `version` is
-// the only subcommand that writes there. In `mcp` mode stdout IS the MCP
+// Exit codes: 0 success, 1 runtime failure (store, socket, missing daemon,
+// failed export write), 2 usage error (unknown command or flag, missing or
+// out-of-range port, an empty file to import). The split matters because
+// run.sh runs under `set -e`.
+//
+// STDOUT POLICY: stdout carries a PRODUCT, never a diagnostic. `version`
+// prints a version string, `cli` a rendered table, `export` the JSONL itself
+// (the subcommand is a data pipe: `taskPilot export > backlog.jsonl`), and
+// `import` the merge report a human reads. In `mcp` mode stdout IS the MCP
 // protocol stream, where one stray line corrupts the framing and the host
 // drops the server with no error the user can act on — so every log line,
 // warning, and banner in this file goes to stderr.
@@ -26,20 +37,29 @@
 // This file stays thin on purpose: parsing, wiring, and the signal loop. Every
 // rule about tasks, ranking, and persistence lives in the layers below it.
 
+#include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <csignal>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
 #include <system_error>
 #include <thread>
 #include <utility>
+#include <vector>
+
+#include <nlohmann/json.hpp>
 
 #include "control/ControlClient.hpp"
 #include "control/JsonRpcServer.hpp"
@@ -86,8 +106,8 @@ struct Config
     /// TCP port of the control socket.
     std::uint16_t port{ kDefaultPort };
 
-    /// Address the control socket binds to (`serve`) or connects to (`mcp`,
-    /// `cli`).
+    /// Address the control socket binds to (`serve`) or connects to (every
+    /// other subcommand that has a daemon).
     ///
     /// LOOPBACK BY DEFAULT because the socket has NO AUTHENTICATION. It is a
     /// single-user personal tool, so anything that can reach the port can
@@ -103,6 +123,8 @@ enum class Command
     kServe,
     kMcp,
     kCli,
+    kExport,
+    kImport,
     /// Named kPrintVersion rather than kVersion to stay clear of the
     /// kVersion string constant, which -Wshadow would flag as a collision.
     kPrintVersion,
@@ -113,6 +135,23 @@ struct Invocation
 {
     Command command{ Command::kServe };
     Config config;
+
+    /// `export --out <path>`: where the JSONL goes. Empty means stdout, which
+    /// is the subcommand's default shape — it is a data pipe.
+    ///
+    /// Deliberately NOT a Config member: Config is the precedence-ordered
+    /// configuration (defaults, then environment, then flags), and these
+    /// options have no environment variable and no default. Sitting next to
+    /// --db they would suggest a source of truth that does not exist.
+    std::string export_out_path;
+
+    /// `import --file <path>`: the export to merge. Empty means stdin.
+    std::string import_file_path;
+
+    /// `import --apply`: true performs the merge, false only reports what it
+    /// would do. The default is the DRY RUN — see runImport for why the
+    /// destructive form is the one that must be asked for.
+    bool apply{ false };
 
     /// -h/--help was given: print usage for `command` and exit 0.
     bool help{ false };
@@ -215,6 +254,16 @@ extern "C" void handleStopSignal(int /*signal_number*/)
         out = Command::kCli;
         return true;
     }
+    if ("export" == text)
+    {
+        out = Command::kExport;
+        return true;
+    }
+    if ("import" == text)
+    {
+        out = Command::kImport;
+        return true;
+    }
     if ("version" == text)
     {
         out = Command::kPrintVersion;
@@ -225,16 +274,18 @@ extern "C" void handleStopSignal(int /*signal_number*/)
 }
 
 /// Overall usage, then the paragraph for `command` specifically — the caller
-/// asked about one subcommand, and a wall of text for all four buries the
+/// asked about one subcommand, and a wall of text for all six buries the
 /// answer.
 void printUsage(std::ostream &out, Command command, bool general_only)
 {
-    out << "usage: " << kProgramName << " <serve|mcp|cli|version> [options]\n"
+    out << "usage: " << kProgramName << " <serve|mcp|cli|export|import|version> [options]\n"
         << "\n"
         << "  serve     run the daemon: opens the task store and serves the control socket\n"
         << "            (the default when no command is given)\n"
         << "  mcp       run the stdio MCP bridge; forwards every call to a running daemon\n"
         << "  cli       attach an interactive console to a running daemon\n"
+        << "  export    write every task and tombstone as JSONL (stdout, or --out <path>)\n"
+        << "  import    merge a JSONL export into the daemon (DRY RUN unless --apply)\n"
         << "  version   print the version and exit\n"
         << "\n"
         << "options:\n"
@@ -242,8 +293,11 @@ void printUsage(std::ostream &out, Command command, bool general_only)
         << "                    default: data/taskpilot.db, created if missing\n"
         << "  --port <n>        control socket port, 1..65535   [TASKPILOT_PORT]\n"
         << "                    default: " << kDefaultPort << "\n"
-        << "  --bind <addr>     bind (serve) or connect (mcp, cli) address\n"
+        << "  --bind <addr>     bind (serve) or connect (mcp, cli, export, import) address\n"
         << "                    [TASKPILOT_BIND]  default: 127.0.0.1\n"
+        << "  --out <path>      export destination (export only; default: stdout)\n"
+        << "  --file <path>     export to merge, replacing stdin (import only)\n"
+        << "  --apply           perform the merge instead of reporting it (import only)\n"
         << "  -h, --help        show this help\n";
 
     if (general_only)
@@ -255,7 +309,9 @@ void printUsage(std::ostream &out, Command command, bool general_only)
         << "  ./run.sh serve                     # daemon on 127.0.0.1:" << kDefaultPort << "\n"
         << "  ./run.sh serve --port 9000 --db /tmp/backlog.db\n"
         << "  ./run.sh mcp                       # what Claude Code spawns\n"
-        << "  ./run.sh cli                       # human REPL against the daemon\n";
+        << "  ./run.sh cli                       # human REPL against the daemon\n"
+        << "  ./run.sh export --out ../taskPilot-data/backlog.jsonl\n"
+        << "  ./run.sh import --file ../taskPilot-data/backlog.jsonl --apply\n";
 
     if (Command::kServe == command)
     {
@@ -269,6 +325,20 @@ void printUsage(std::ostream &out, Command command, bool general_only)
     else if (Command::kMcp == command)
     {
         out << "\nmcp speaks the MCP protocol on stdin/stdout and logs to stderr only.\n";
+    }
+    else if (Command::kExport == command)
+    {
+        out << "\nexport needs a running daemon (./run.sh serve). It writes the whole backlog,\n"
+            << "one record per line, to stdout — or to --out, which also prints a summary on\n"
+            << "stderr. stdout is the data, so redirect it, and keep the result in the\n"
+            << "private data repository rather than this public one.\n";
+    }
+    else if (Command::kImport == command)
+    {
+        out << "\nimport needs a running daemon (./run.sh serve) and MERGES the export read from\n"
+            << "--file, or from stdin, into it. IT IS A DRY RUN BY DEFAULT: without --apply it\n"
+            << "reports what would change and writes nothing. A merge can overwrite or delete\n"
+            << "tasks, so the form that writes has to be asked for explicitly.\n";
     }
 }
 
@@ -328,7 +398,29 @@ void printUsage(std::ostream &out, Command command, bool general_only)
             return invocation;
         }
 
-        if ("--db" != flag && "--port" != flag && "--bind" != flag)
+        // --apply is the one flag that takes no value: its presence IS the
+        // value, so it is settled before the value-taking options below and
+        // never consumes the next argument (which would silently eat the
+        // subcommand's own operand).
+        if ("--apply" == flag)
+        {
+            if (Command::kImport != invocation.command)
+            {
+                invocation.error = "--apply is only valid for import";
+                return invocation;
+            }
+            invocation.apply = true;
+            continue;
+        }
+
+        // Every remaining option takes a value. --db, --port and --bind are
+        // accepted whatever the subcommand is, as they always have been:
+        // refusing them now would turn command lines that work today into
+        // usage errors for no gain. --out and --file are new, so they are
+        // scoped to the single subcommand that can act on them, and typing one
+        // at the wrong subcommand says so instead of being dropped.
+        if ("--db" != flag && "--port" != flag && "--bind" != flag && "--out" != flag
+            && "--file" != flag)
         {
             invocation.error = "unknown option: " + flag;
             return invocation;
@@ -365,9 +457,27 @@ void printUsage(std::ostream &out, Command command, bool general_only)
         {
             invocation.config.db_path = value;
         }
-        else
+        else if ("--bind" == flag)
         {
             invocation.config.bind_address = value;
+        }
+        else if ("--out" == flag)
+        {
+            if (Command::kExport != invocation.command)
+            {
+                invocation.error = "--out is only valid for export";
+                return invocation;
+            }
+            invocation.export_out_path = value;
+        }
+        else
+        {
+            if (Command::kImport != invocation.command)
+            {
+                invocation.error = "--file is only valid for import";
+                return invocation;
+            }
+            invocation.import_file_path = value;
         }
     }
 
@@ -375,21 +485,22 @@ void printUsage(std::ostream &out, Command command, bool general_only)
     return invocation;
 }
 
-/// Create the parent directory of `db_path` when it does not exist yet.
+/// Create the parent directory of `path` when it does not exist yet.
 ///
-/// SQLite creates the database FILE but never the directory above it, and the
-/// default path (data/taskpilot.db) lives in a directory a fresh clone does
-/// not have — so without this step the very first `./run.sh serve` fails with
-/// a bare "unable to open database file".
-[[nodiscard]] bool ensureParentDirectory(const std::string &db_path, std::string &error)
+/// Used for both files this program creates: the SQLite database and the
+/// `export --out` destination. Neither writes the directory above the file —
+/// SQLite fails with a bare "unable to open database file" and std::ofstream
+/// simply fails to open — and the default locations (data/taskpilot.db,
+/// export/…) sit in directories a fresh clone does not have.
+[[nodiscard]] bool ensureParentDirectory(const std::string &path, std::string &error)
 {
     // ":memory:" and any URI-style path has no filesystem parent.
-    if (db_path.empty() || ':' == db_path.front())
+    if (path.empty() || ':' == path.front())
     {
         return true;
     }
 
-    const std::filesystem::path parent = std::filesystem::path(db_path).parent_path();
+    const std::filesystem::path parent = std::filesystem::path(path).parent_path();
     if (parent.empty())
     {
         // A bare filename means the current directory, which exists.
@@ -405,6 +516,18 @@ void printUsage(std::ostream &out, Command command, bool general_only)
     }
 
     return true;
+}
+
+/// Report a failed control-socket call, in the form every client subcommand
+/// uses.
+///
+/// The client's own message is surfaced verbatim: when nothing is listening it
+/// already names the command that starts a daemon, and when a merge fails it
+/// names the offending line. Replacing either with a generic "the call failed"
+/// would send the user looking in the wrong place.
+void reportRpcFailure(const Error &error)
+{
+    std::cerr << kProgramName << ": " << error.message << "\n";
 }
 
 /// `serve` — run the daemon until a stop signal arrives.
@@ -537,11 +660,363 @@ void printUsage(std::ostream &out, Command command, bool general_only)
     return 0;
 }
 
+/// `export` — write every task and tombstone as JSONL, through the daemon.
+///
+/// REQUIRES A RUNNING DAEMON, as `cli` and `mcp` do and as `version` does not.
+/// That is the intended shape rather than a limitation: everything that
+/// touches the backlog goes through the daemon, which is its single writer, so
+/// the file on disk always has exactly one process whose view of it is
+/// authoritative. Opening the database from this short-lived process instead
+/// would be at best a lock conflict with the daemon that holds it open for its
+/// whole life, and at worst a write into an inode the daemon has already
+/// replaced — a failure mode that leaves two processes believing different
+/// files are the backlog.
+[[nodiscard]] int runExport(const Config &config, const std::string &out_path)
+{
+    // No ping() first: a missing daemon is reported by the call itself, with
+    // the command that fixes it, and a probe would only open a window in which
+    // the daemon can exit between the probe and the call.
+    const ControlClient client(config.bind_address, config.port);
+
+    const RpcResult response = client.call("export_tasks", nlohmann::json::object());
+    if (!response.ok())
+    {
+        reportRpcFailure(response.error());
+        return 1;
+    }
+
+    const nlohmann::json &result = response.value();
+    const auto jsonl = result.find("jsonl");
+    if (result.end() == jsonl || !jsonl->is_string())
+    {
+        // A reply without the payload means the thing on this port speaks a
+        // different export protocol — an older binary, say. Saying so beats
+        // printing nothing, which would be indistinguishable from an empty
+        // backlog, and worse, would be written to the user's file as one.
+        std::cerr << kProgramName << ": the daemon returned no export; is a different "
+                  << kProgramName << " listening on " << config.bind_address << ":"
+                  << config.port << "?\n";
+        return 1;
+    }
+
+    const std::string lines = jsonl->get<std::string>();
+
+    // The summary's record count. The daemon sends its own tally; counting the
+    // newlines is the fallback for a reply that lacks it and is exact for this
+    // format, because every record is one newline-terminated line.
+    std::size_t records{ 0 };
+    if (const auto count = result.find("count");
+        result.end() != count && count->is_number_integer())
+    {
+        records = static_cast<std::size_t>(count->get<std::int64_t>());
+    }
+    else
+    {
+        records = static_cast<std::size_t>(std::count(lines.begin(), lines.end(), '\n'));
+    }
+
+    if (out_path.empty())
+    {
+        // The JSONL is this subcommand's product, so it goes to stdout byte for
+        // byte — `taskPilot export > backlog.jsonl` and
+        // `taskPilot export --out backlog.jsonl` must produce identical files,
+        // which is why nothing else (not even a "done" line) shares this
+        // stream.
+        std::cout << lines;
+        return 0;
+    }
+
+    std::string directory_error;
+    if (!ensureParentDirectory(out_path, directory_error))
+    {
+        std::cerr << kProgramName << ": " << directory_error << "\n";
+        return 1;
+    }
+
+    // Truncate rather than append: an export is a COMPLETE snapshot, so
+    // whatever bytes are already in the file are stale by definition — and a
+    // second copy of the same uids would break the one-line-per-uid property
+    // the format and its merge both depend on.
+    std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
+    if (!out.is_open())
+    {
+        std::cerr << kProgramName << ": cannot write " << out_path << ": " << std::strerror(errno)
+                  << "\n";
+        return 1;
+    }
+
+    out << lines;
+    out.close();
+    if (out.fail())
+    {
+        // A full disk or an I/O error part-way through. The file exists and
+        // holds a prefix of the export, so it is removed: a snapshot that is
+        // merely SHORT is the one artefact a later `git add` would happily
+        // commit and the next machine would happily merge, and a missing file
+        // is a far more obvious failure than a truncated one.
+        std::error_code removal_failure;
+        std::filesystem::remove(out_path, removal_failure);
+        std::cerr << kProgramName << ": cannot write " << out_path
+                  << ": the export was not written completely, and the partial file was removed\n";
+        return 1;
+    }
+
+    // The summary is a diagnostic and stdout is carrying the data only when
+    // --out is absent, so with --out the count and the path go to stderr.
+    std::cerr << kProgramName << ": wrote " << records << " records to " << out_path << "\n";
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Merge report rendering
+// ---------------------------------------------------------------------------
+
+/// One line of the printed merge report.
+struct MergeRow
+{
+    const char *counter_key; ///< Wire key of the count.
+    const char *titles_key;  ///< Wire key of the example titles, or nullptr.
+    const char *label;       ///< How the row is named when printed.
+    const char *marker;      ///< One-character prefix for an example title.
+};
+
+/// The rows of a report, in the order a reader wants them: what arrived, what
+/// was overwritten, what was removed, what came back, and what the local copy
+/// already had.
+///
+/// The keys are the store's own MergeReport field names, because that struct
+/// is what the daemon serializes; the labels are separate because they are how
+/// a person reads the same thing. The dry run and the applied merge print
+/// identical blocks, so the report a user approved is one they can compare the
+/// real run against line by line.
+constexpr MergeRow kMergeRows[]{
+    { "inserted", "inserted_titles", "inserted", "+" },
+    { "updated", "updated_titles", "updated", "~" },
+    { "deleted", "deleted_titles", "deleted", "-" },
+    { "resurrected", "resurrected_titles", "resurrected", "+" },
+    { "skipped", nullptr, "skipped", "" },
+};
+
+/// Read one counter out of a merge report. nullopt when the document holds no
+/// integer under that key, which the caller reports as an unreadable report
+/// rather than as a count of zero: "nothing changed" and "I cannot read the
+/// answer" must never look alike, and this is a report about overwriting work.
+[[nodiscard]] std::optional<std::int64_t> reportCounter(const nlohmann::json &report,
+                                                        const char *key)
+{
+    const auto entry = report.find(key);
+    if (report.end() == entry || !entry->is_number_integer())
+    {
+        return std::nullopt;
+    }
+
+    return entry->get<std::int64_t>();
+}
+
+/// The example titles of one report row. Entries that are not strings are
+/// dropped rather than rejected: one malformed element must not cost the reader
+/// the rest of the report, which is the only account of what a merge did.
+[[nodiscard]] std::vector<std::string> reportTitles(const nlohmann::json &report,
+                                                    const char *key)
+{
+    std::vector<std::string> titles;
+    if (nullptr == key)
+    {
+        return titles;
+    }
+
+    const auto list = report.find(key);
+    if (report.end() == list || !list->is_array())
+    {
+        return titles;
+    }
+
+    for (const nlohmann::json &entry : *list)
+    {
+        if (entry.is_string())
+        {
+            titles.push_back(entry.get<std::string>());
+        }
+    }
+
+    return titles;
+}
+
+/// Print a merge report for a human.
+///
+/// `applied` only changes the heading: a dry run and its matching real merge
+/// carry the same numbers, which is what makes the dry run evidence about the
+/// run that follows it rather than a separate story.
+void printMergeReport(std::ostream &out, const nlohmann::json &report, bool applied)
+{
+    out << (applied ? "merge applied:" : "merge (dry run):") << "\n";
+
+    bool recognized{ false };
+    for (const MergeRow &row : kMergeRows)
+    {
+        const std::optional<std::int64_t> counter = reportCounter(report, row.counter_key);
+        if (!counter.has_value())
+        {
+            continue;
+        }
+        recognized = true;
+
+        out << "  " << row.label << ": " << *counter << "\n";
+
+        const std::vector<std::string> titles = reportTitles(report, row.titles_key);
+        for (const std::string &title : titles)
+        {
+            out << "    " << row.marker << " " << title << "\n";
+        }
+
+        // The store keeps the counts exact but caps the example lists, so the
+        // gap has to be visible: a list that quietly stopped inside a first
+        // sync of a large file would otherwise read as the whole story.
+        if (nullptr != row.titles_key && titles.size() < static_cast<std::size_t>(*counter))
+        {
+            out << "    (" << (*counter - static_cast<std::int64_t>(titles.size()))
+                << " more not listed)\n";
+        }
+    }
+
+    if (!recognized)
+    {
+        // The reply is not a report this client knows how to read. Printing it
+        // whole is the honest fallback — it still tells the reader what
+        // changed, whereas a fabricated "0 inserted" would send them looking in
+        // the wrong place.
+        out << report.dump(2) << "\n";
+    }
+}
+
+/// True when a report says the merge changed nothing (or would change
+/// nothing); nullopt when the counters cannot be read at all, so the caller
+/// falls back to advice that is safe whichever the answer is.
+///
+/// "skipped" is deliberately excluded from the sum: the local copy already
+/// winning a record is precisely what a no-op sync looks like, and counting it
+/// would make every clean merge look like work.
+[[nodiscard]] std::optional<bool> reportIsClean(const nlohmann::json &report)
+{
+    constexpr const char *kChangeKeys[]{ "inserted", "updated", "deleted", "resurrected" };
+
+    bool recognized{ false };
+    bool changed{ false };
+    for (const char *key : kChangeKeys)
+    {
+        const std::optional<std::int64_t> counter = reportCounter(report, key);
+        if (!counter.has_value())
+        {
+            continue;
+        }
+
+        recognized = true;
+        changed = changed || 0 < *counter;
+    }
+
+    if (!recognized)
+    {
+        return std::nullopt;
+    }
+
+    return !changed;
+}
+
+/// `import` — merge a JSONL export into the daemon's store.
+///
+/// DRY RUN BY DEFAULT, deliberately: a merge can overwrite or delete local
+/// work, and omitting a flag is the quietest way to ask for anything, so the
+/// form that writes must be the one that has to be requested. The dry run is
+/// not a preview feature bolted on — it takes the same decisions and produces
+/// the same report the real merge will, so approving it is approving an
+/// outcome rather than a guess.
+///
+/// Like `export`, and for the same single-writer reason, this goes through the
+/// daemon instead of opening the database itself.
+[[nodiscard]] int runImport(const Config &config, const std::string &file_path, bool apply)
+{
+    std::string jsonl;
+    if (file_path.empty())
+    {
+        jsonl.assign(std::istreambuf_iterator<char>(std::cin), std::istreambuf_iterator<char>());
+        if (std::cin.bad())
+        {
+            std::cerr << kProgramName << ": cannot read the export from stdin\n";
+            return 1;
+        }
+    }
+    else
+    {
+        std::ifstream in(file_path, std::ios::binary);
+        if (!in.is_open())
+        {
+            std::cerr << kProgramName << ": cannot read " << file_path << ": "
+                      << std::strerror(errno) << "\n";
+            return 1;
+        }
+
+        jsonl.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        if (in.bad())
+        {
+            std::cerr << kProgramName << ": cannot read " << file_path << "\n";
+            return 1;
+        }
+    }
+
+    // An empty input is a usage error, not a clean merge of zero records: it
+    // means the file is empty or the redirection was forgotten, and a merge is
+    // additive unless a tombstone says otherwise, so reporting "no changes"
+    // would let a pipeline that moved nothing look exactly like a sync that
+    // had nothing to move.
+    if (std::string::npos == jsonl.find_first_not_of(" \t\r\n\v\f"))
+    {
+        std::cerr << kProgramName << ": nothing to import: expected the JSONL that"
+                  << " `taskPilot export` writes\n";
+        return 2;
+    }
+
+    // dry_run is sent in both directions rather than left to the daemon's
+    // default. The daemon's default is also "dry run", and saying so here means
+    // this client's behaviour cannot be changed by that default moving.
+    const ControlClient client(config.bind_address, config.port);
+    const nlohmann::json params{ { "jsonl", jsonl }, { "dry_run", !apply } };
+    const RpcResult response = client.call("import_tasks", params);
+    if (!response.ok())
+    {
+        // For a malformed export this is where the line number arrives, so the
+        // message is surfaced verbatim: it is the only pointer to the record
+        // that stopped the merge.
+        reportRpcFailure(response.error());
+        return 1;
+    }
+
+    // The report IS this subcommand's product — it is what a human reads to
+    // decide whether the merge it describes is the one they wanted — so it goes
+    // to stdout.
+    printMergeReport(std::cout, response.value(), apply);
+    if (!apply)
+    {
+        if (reportIsClean(response.value()).value_or(false))
+        {
+            // The common case, and worth stating plainly: the two sides agree,
+            // so there is nothing for --apply to do and telling the user to
+            // re-run would only send them round the loop again.
+            std::cout << "nothing to do: this backlog already matches the export.\n";
+        }
+        else
+        {
+            std::cout << "nothing was written: this was a dry run. Re-run with --apply to"
+                      << " perform the merge.\n";
+        }
+    }
+    return 0;
+}
+
 /// `version` — print the version and exit.
 [[nodiscard]] int runVersion()
 {
-    // The one documented use of stdout: a version string is a machine-readable
-    // product (scripts and MCP configs parse it), not a diagnostic.
+    // stdout carries it because a version string is a product (scripts and MCP
+    // configs parse it), not a diagnostic.
     std::cout << kProgramName << " " << kVersion << "\n";
     return 0;
 }
@@ -574,6 +1049,11 @@ int main(int argc, char **argv)
         return taskpilot::runMcp(invocation.config);
     case taskpilot::Command::kCli:
         return taskpilot::runCli(invocation.config);
+    case taskpilot::Command::kExport:
+        return taskpilot::runExport(invocation.config, invocation.export_out_path);
+    case taskpilot::Command::kImport:
+        return taskpilot::runImport(invocation.config, invocation.import_file_path,
+                                    invocation.apply);
     case taskpilot::Command::kPrintVersion:
         return taskpilot::runVersion();
     }
