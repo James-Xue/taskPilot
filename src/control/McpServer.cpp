@@ -440,6 +440,13 @@ std::string McpServer::handleLine(const std::string &line, Backend &backend,
         params = request["params"];
     }
 
+    // Whether this request arrived through the modern (per-request metadata)
+    // era. A legacy client declares its version inside `initialize` instead of
+    // in `_meta`, so a version present in `_meta` IS the era marker — there is
+    // no other shape a modern request can take. Declared before the respond
+    // funnel because the funnel reads it, and set below at the version gate.
+    bool modern_request = false;
+
     // Single funnel for every response. Placing the notification test inside it
     // (rather than at each return site) is what makes the rule impossible to
     // forget as methods are added.
@@ -448,6 +455,26 @@ std::string McpServer::handleLine(const std::string &line, Backend &backend,
         if (is_notification)
         {
             return std::string{};
+        }
+
+        // Modern results must be self-describing. Revision 2026-07-28 requires
+        // every result to carry `resultType`, and the "absent means complete"
+        // bridge is granted only to earlier-revision servers. The cost of
+        // omitting it is not a warning: a client that saw 2026-07-28 in our
+        // version list rejects the result outright, and a rejected tools/list
+        // means the model is handed no tools at all while the server still
+        // looks connected. "complete" is the value the reference SDK defaults
+        // to; the field is an open union, so a future partial-result mode can
+        // add values without breaking this.
+        //
+        // Stamped here, in the one funnel, rather than at each result site —
+        // same reasoning as the notification test above, and it is why adding
+        // a method cannot forget it.
+        if (modern_request && payload.contains("result") && payload["result"].is_object())
+        {
+            nlohmann::json stamped = payload;
+            stamped["result"]["resultType"] = "complete";
+            return encodeResponse(request["id"], stamped);
         }
         return encodeResponse(request["id"], payload);
     };
@@ -484,6 +511,10 @@ std::string McpServer::handleLine(const std::string &line, Backend &backend,
     //    through the funnel, a notification declaring an unsupported version is
     //    dropped in silence rather than provoking an illegal reply.
     const std::string declared = declaredProtocolVersion(params);
+    // Recorded before the gate decides anything, because an UNSUPPORTED version
+    // is still a modern request and its -32022 reply must be a well-formed
+    // modern result. See the respond funnel for what this stamps.
+    modern_request = !declared.empty();
     if (!declared.empty() && !isVersionSupported(declared))
     {
         return respond(errorPayload(kErrorUnsupportedProtocolVersion,
@@ -538,7 +569,18 @@ std::string McpServer::handleLine(const std::string &line, Backend &backend,
         // No session check, deliberately. A modern client calls this as its
         // first (or only) message; a legacy client calls it after `initialize`.
         // Both get the same answer, which is the coexistence contract.
-        return respond(resultPayload(nlohmann::json{ { "tools", toolDefinitions() } }));
+        //
+        // ttlMs/cacheScope are stated rather than left to the client's defaults
+        // because the 2026-07-28 schema for this result declares both. Zero ttl
+        // means "do not cache": the catalog is static, so caching would be
+        // safe, but a stale tool list is the kind of failure that looks like a
+        // broken server, and this call is cheap. `private` because the reply
+        // describes this build of this server, not a shared resource.
+        return respond(resultPayload(nlohmann::json{
+            { "tools", toolDefinitions() },
+            { "ttlMs", 0 },
+            { "cacheScope", "private" },
+        }));
     }
 
     // 10. tools/call — validate, then forward to the daemon.

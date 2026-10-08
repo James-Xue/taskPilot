@@ -428,6 +428,84 @@ TEST(McpServerModernEra, DiscoverAndUnsupportedPayloadsShareOneVersionList)
               unsupported["supported"].get<std::vector<std::string>>());
 }
 
+TEST(McpServerModernEra, EveryModernResultIsStampedWithAResultType)
+{
+    // Revision 2026-07-28 requires every result to carry `resultType`, and the
+    // "absent means complete" bridge is granted only to earlier-revision
+    // servers. This was found the hard way: a live modern client parsed our
+    // discover reply, accepted the version list, then rejected tools/list with
+    // "missing required resultType" — so the model was handed no tools at all
+    // while the server still looked connected. That silent half-state, where
+    // negotiation succeeds and the catalog never arrives, is what this test
+    // exists to prevent.
+    FakeBackend backend;
+    bool should_exit = false;
+
+    const nlohmann::json discover = exchange(
+        requestLine("server/discover", paramsWithDeclaredVersion("2026-07-28")),
+        backend, should_exit);
+    ASSERT_TRUE(discover.contains("result")) << discover.dump();
+    EXPECT_EQ("complete", discover["result"].value("resultType", ""));
+
+    const nlohmann::json tools = exchange(
+        requestLine("tools/list", paramsWithDeclaredVersion("2026-07-28")),
+        backend, should_exit);
+    ASSERT_TRUE(tools.contains("result")) << tools.dump();
+    EXPECT_EQ("complete", tools["result"].value("resultType", ""));
+    // The 2026-07-28 schema for this result declares both of these explicitly.
+    EXPECT_EQ(0, tools["result"].value("ttlMs", -1));
+    EXPECT_EQ("private", tools["result"].value("cacheScope", ""));
+
+    nlohmann::json call_params = paramsWithDeclaredVersion(
+        "2026-07-28",
+        nlohmann::json{ { "name", anyCatalogTool() },
+                        { "arguments", nlohmann::json::object() } });
+    backend.setReply(nlohmann::json{ { "ok", true } });
+    const nlohmann::json called = exchange(requestLine("tools/call", call_params),
+                                           backend, should_exit);
+    ASSERT_TRUE(called.contains("result")) << called.dump();
+    EXPECT_EQ("complete", called["result"].value("resultType", ""));
+
+    // A tool-level failure is still a RESULT (isError:true), so it is stamped
+    // too. An error reply is not, and the assertions below pin that difference.
+    backend.setFailure(Error::notFound("no task with id 7"));
+    const nlohmann::json failed = exchange(requestLine("tools/call", call_params),
+                                           backend, should_exit);
+    ASSERT_TRUE(failed.contains("result")) << failed.dump();
+    EXPECT_TRUE(failed["result"].value("isError", false));
+    EXPECT_EQ("complete", failed["result"].value("resultType", ""));
+}
+
+TEST(McpServerLegacyHandshake, HandshakeEraResultsAreNotStampedWithAResultType)
+{
+    // No `_meta` means a handshake-era client, whose result schemas predate
+    // resultType. Stamping it there would describe an era the client never
+    // asked for, and the field is meaningless to it.
+    FakeBackend backend;
+    bool should_exit = false;
+
+    const nlohmann::json tools =
+        exchange(requestLine("tools/list"), backend, should_exit);
+    ASSERT_TRUE(tools.contains("result")) << tools.dump();
+    EXPECT_FALSE(tools["result"].contains("resultType")) << tools.dump();
+
+    const nlohmann::json init = exchange(
+        requestLine("initialize", nlohmann::json{ { "protocolVersion", "2025-06-18" } }),
+        backend, should_exit);
+    ASSERT_TRUE(init.contains("result")) << init.dump();
+    EXPECT_FALSE(init["result"].contains("resultType")) << init.dump();
+
+    // An error reply carries no result, so there is nothing to stamp — and
+    // stamping into an envelope that has no `result` would be the bug the
+    // guard in the respond funnel exists to avoid.
+    const nlohmann::json rejected = exchange(
+        requestLine("tools/list",
+                    paramsWithDeclaredVersion("1999-01-01")),
+        backend, should_exit);
+    ASSERT_TRUE(rejected.contains("error")) << rejected.dump();
+    EXPECT_EQ(-32022, rejected["error"].value("code", 0));
+}
+
 // ---------------------------------------------------------------------------
 // tools/list
 // ---------------------------------------------------------------------------

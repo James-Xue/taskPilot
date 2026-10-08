@@ -219,6 +219,24 @@ path never engaged. That is why the two shapes are pinned here and asserted by
   looks up the one name it knows, so an alias is a second contract with no
   reader — and one a future edit could get wrong on its own.
 - The `-32022` data is exactly `{"supported": [...], "requested": "..."}`.
+- Every **modern result** carries `resultType: "complete"`. This one is not a
+  key name but a whole missing field, and it was found against a live client
+  rather than in review: the client parsed the discover reply, accepted
+  `2026-07-28`, then rejected `tools/list` with
+
+  ```
+  Invalid result for tools/list: missing required resultType — servers
+  implementing protocol revision 2026-07-28 MUST include it (the
+  absent-means-complete bridge applies only to earlier-revision servers)
+  ```
+
+  The half-state it produces is the worst kind: negotiation succeeds, the
+  server reports `✔ Connected`, and the model is handed **no tools at all**.
+  `resultType` is stamped in one funnel for every result of a modern request
+  (and only a modern one — a handshake-era client predates the field), so a
+  method cannot be added without it. `tools/list` additionally carries
+  `ttlMs: 0` and `cacheScope: "private"`, both declared by the 2026-07-28
+  schema for that result.
 
 ### The version gate
 
