@@ -33,6 +33,17 @@
 //      deadline: a client that dropped its timeout fails the test by name in
 //      seconds instead of parking the suite until the CTest timeout, which is
 //      what a test that hangs on failure is worth.
+//
+// Every asio call below is written as `std::ignore = call(...)` because asio's
+// error_code overloads hand the result back TWICE: they fill the caller's out
+// parameter and return the same code, as ASIO_SYNC_OP_VOID expands to
+// asio::error_code unless the build defines ASIO_NO_DEPRECATED. The out
+// parameter is what these fixtures read — either immediately or at the end of a
+// short sequence of setup calls — so the returned copy is redundant rather than
+// missed, and the assignment says so. A bare `call(...);` cannot: it reads as a
+// swallowed error, which is what clang-tidy's bugprone-unused-return-value is
+// right to flag, and what a `(void)` cast fails to fix (that check's
+// AllowCastToVoid option defaults to off).
 
 #include "control/ControlClient.hpp"
 
@@ -58,6 +69,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <utility>
 
 #include <nlohmann/json.hpp>
@@ -231,9 +243,9 @@ void expectErrorMessage(const RpcResult &result, ErrorCode expected,
     const asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v4(), kAnyFreePort);
 
     std::error_code ec;
-    acceptor.open(endpoint.protocol(), ec);
-    acceptor.bind(endpoint, ec);
-    acceptor.listen(asio::socket_base::max_listen_connections, ec);
+    std::ignore = acceptor.open(endpoint.protocol(), ec);
+    std::ignore = acceptor.bind(endpoint, ec);
+    std::ignore = acceptor.listen(asio::socket_base::max_listen_connections, ec);
 
     std::uint16_t port = kAnyFreePort;
     if (!ec)
@@ -244,7 +256,7 @@ void expectErrorMessage(const RpcResult &result, ErrorCode expected,
     // Released unconditionally: the caller wants the closed state, not the
     // listener, and a reservation that failed has nothing left open anyway.
     std::error_code ignored;
-    acceptor.close(ignored);
+    std::ignore = acceptor.close(ignored);
     return port;
 }
 
@@ -284,9 +296,9 @@ class FakeServer
         const asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v4(), kAnyFreePort);
 
         std::error_code ec;
-        m_acceptor.open(endpoint.protocol(), ec);
-        m_acceptor.bind(endpoint, ec);
-        m_acceptor.listen(asio::socket_base::max_listen_connections, ec);
+        std::ignore = m_acceptor.open(endpoint.protocol(), ec);
+        std::ignore = m_acceptor.bind(endpoint, ec);
+        std::ignore = m_acceptor.listen(asio::socket_base::max_listen_connections, ec);
         if (ec)
         {
             // A loopback bind cannot fail for a reason a test can act on, and
@@ -301,7 +313,7 @@ class FakeServer
         // Non-blocking so the accept loop can poll the stop flag: a blocking
         // accept() parked on a port nobody dials cannot be woken by close()
         // from another thread, and joining that thread would hang the suite.
-        m_acceptor.non_blocking(true, ec);
+        std::ignore = m_acceptor.non_blocking(true, ec);
         if (ec)
         {
             throw std::runtime_error("fake control server could not go non-blocking: " +
@@ -343,7 +355,7 @@ class FakeServer
 
             asio::ip::tcp::socket peer(m_io);
             std::error_code ec;
-            m_acceptor.accept(peer, ec);
+            std::ignore = m_acceptor.accept(peer, ec);
             if (asio::error::would_block == ec || asio::error::try_again == ec)
             {
                 // Nobody is waiting yet; kPollInterval is what bounds how soon
@@ -364,7 +376,7 @@ class FakeServer
         // Closed on the thread that owns it, after the loop has decided to
         // leave. The stop flag, not this close, is what ends the loop.
         std::error_code ignored;
-        m_acceptor.close(ignored);
+        std::ignore = m_acceptor.close(ignored);
     }
 
     /// Play `m_script` for one accepted connection, then close it.
@@ -408,7 +420,7 @@ class FakeServer
         // closing a socket with unread data still queued sends a reset, and a
         // reset can discard the reply the client is about to read.
         std::error_code ignored;
-        peer.close(ignored);
+        std::ignore = peer.close(ignored);
     }
 
     /// Read one '\n'-terminated request line, giving up as soon as stop() is
@@ -423,7 +435,7 @@ class FakeServer
     [[nodiscard]] bool readRequestLine(asio::ip::tcp::socket &peer, std::string &line)
     {
         std::error_code ec;
-        peer.non_blocking(true, ec);
+        std::ignore = peer.non_blocking(true, ec);
         if (ec)
         {
             return false;

@@ -598,6 +598,62 @@ TEST_F(ServicesTest, GetTaskReportsTheScoreWithItsBreakdown)
     EXPECT_EQ(-32001, rpcErrorCode(missing.code));
 }
 
+TEST_F(ServicesTest, GetTaskReportsTheScoreForFinishedWorkToo)
+{
+    // The score is reported for EVERY status, not only the actionable ones: the
+    // queue filters, the math does not. A task that is done still has an
+    // importance, a deadline, an age and a block count, and a caller asking
+    // about that one task by id wants the number those fields produce — not a
+    // zero it cannot explain. So this asserts the exact total AND the four
+    // terms behind it, which is what a regression gating the score on
+    // isActionable() (0.0, all-zero parts) has to fail.
+    const nlohmann::json created =
+        addTask(harness.services, "already shipped", { { "importance", 5 }, { "blocks", 2 } });
+    const std::int64_t id = created.at("id").get<std::int64_t>();
+
+    // created_at is stamped by the store's own clock, so "three days old" is
+    // produced by moving the injected clock exactly three days past the instant
+    // the store actually wrote, and the deadline is that same instant so the
+    // urgency ramp saturates at 1.0.
+    harness.clock.setNow(created.at("created_at").get<std::int64_t>() + 3 * kSecondsPerDay);
+    callOk(harness.services, "update_task",
+           { { "id", id }, { "due_at", harness.clock.nowEpochSeconds() } });
+    callOk(harness.services, "complete_task", { { "id", id } });
+
+    const nlohmann::json done = callOk(harness.services, "get_task", { { "id", id } });
+    ASSERT_EQ(done.at("status").get<std::string>(), "done");
+
+    // importance 5 x 5 = 25, urgency 30 x 1.0 = 30 (due now saturates the
+    // ramp), age 2 x 3 = 6, blocks 8 x 2 = 16. Every term is exactly
+    // representable in binary, so the total is exact rather than merely near.
+    EXPECT_DOUBLE_EQ(done.at("score").get<double>(), 77.0);
+    ASSERT_TRUE(done.at("score_parts").is_object());
+    EXPECT_DOUBLE_EQ(done.at("score_parts").at("importance").get<double>(), 25.0);
+    EXPECT_DOUBLE_EQ(done.at("score_parts").at("urgency").get<double>(), 30.0);
+    EXPECT_DOUBLE_EQ(done.at("score_parts").at("age").get<double>(), 6.0);
+    EXPECT_DOUBLE_EQ(done.at("score_parts").at("blocks").get<double>(), 16.0);
+
+    // Archiving is the other way work leaves the queue, and the handler has no
+    // status branch at all — it reads the task and scores it, whatever the
+    // status says — so an archived task reports the same 77.0 and the same
+    // breakdown rather than a second, quieter rule.
+    const nlohmann::json archived =
+        callOk(harness.services, "update_task", { { "id", id }, { "status", "archived" } });
+    ASSERT_EQ(archived.at("status").get<std::string>(), "archived");
+
+    const nlohmann::json after = callOk(harness.services, "get_task", { { "id", id } });
+    EXPECT_DOUBLE_EQ(after.at("score").get<double>(), 77.0);
+    EXPECT_DOUBLE_EQ(after.at("score_parts").at("importance").get<double>(), 25.0);
+    EXPECT_DOUBLE_EQ(after.at("score_parts").at("urgency").get<double>(), 30.0);
+    EXPECT_DOUBLE_EQ(after.at("score_parts").at("age").get<double>(), 6.0);
+    EXPECT_DOUBLE_EQ(after.at("score_parts").at("blocks").get<double>(), 16.0);
+
+    // Reporting is not ranking: the queue still refuses both finished statuses,
+    // which is the half of the contract the score being non-zero must not
+    // undermine.
+    EXPECT_TRUE(callOk(harness.services, "get_queue").at("queue").empty());
+}
+
 TEST_F(ServicesTest, GetStatsReportsTheTopOfTheQueue)
 {
     const nlohmann::json created = addTask(harness.services, "the important one",
@@ -893,6 +949,67 @@ TEST_F(ServicesTest, ParamsMustBeAnObjectAndNullIsTreatedAsEmpty)
     const Error withArray = callError(harness.services, "get_status", nlohmann::json::array());
     EXPECT_EQ(ErrorCode::kInvalidArgument, withArray.code);
     EXPECT_NE(std::string::npos, withArray.message.find("params"));
+}
+
+TEST_F(ServicesTest, AClientSuppliedNowIsOverwrittenRatherThanTrusted)
+{
+    // invoke() stamps "__taskpilot_now" with the instant it sampled, and it does
+    // so unconditionally. That is the whole anti-forgery guarantee: the key
+    // travels with the params — the handler signature takes nothing else — so a
+    // caller that could set it would choose the clock its own ranking was
+    // computed against. The stamp is therefore not "metadata the caller may
+    // already have supplied"; it is overwritten, and the check below is what
+    // says so.
+    //
+    // Epoch 0 is the sharpest forgeable value available: it is a legal
+    // integer, a plausible-looking default, and it moves the reference instant
+    // by decades.
+    const nlohmann::json created =
+        addTask(harness.services, "three days old", { { "importance", 5 }, { "blocks", 2 } });
+    addTask(harness.services, "brand new", { { "importance", 1 } });
+
+    harness.clock.setNow(created.at("created_at").get<std::int64_t>() + 3 * kSecondsPerDay);
+    callOk(harness.services, "update_task",
+           { { "id", created.at("id") }, { "due_at", harness.clock.nowEpochSeconds() } });
+
+    const nlohmann::json honest = callOk(harness.services, "get_queue");
+    const nlohmann::json forged =
+        callOk(harness.services, "get_queue", { { "__taskpilot_now", 0 } });
+
+    // The ranking IS the reply — order, totals and the four terms behind them —
+    // so it is compared whole. One line per entry, because a mismatch that
+    // prints two entire JSON documents is a mismatch nobody reads.
+    const auto signatureOf = [](const nlohmann::json &queue) {
+        std::vector<std::string> rows;
+        for (const nlohmann::json &entry : queue.at("queue"))
+        {
+            rows.push_back(entry.at("title").get<std::string>() +
+                           " score=" + std::to_string(entry.at("score").get<double>()) +
+                           " parts=" + entry.at("score_parts").dump());
+        }
+        return rows;
+    };
+    EXPECT_EQ(signatureOf(forged), signatureOf(honest))
+        << "a caller-supplied __taskpilot_now must not survive invoke()";
+
+    // The reply's own `now` is the instant the handlers were given, so it is
+    // the forged value if and only if the stamp was skipped.
+    EXPECT_EQ(forged.at("now").get<std::int64_t>(), harness.clock.nowEpochSeconds());
+
+    // And the absolute value, so that two identically wrong calls cannot pass
+    // by agreeing with each other: importance 5 x 5 = 25, urgency 30 x 1.0 = 30
+    // (due now saturates the ramp), age 2 x 3 = 6, blocks 8 x 2 = 16 — 77.0.
+    // Ranked against the epoch instead, the same task scores 41.0: its deadline
+    // would be decades out (a horizon of seven days earns no urgency at all)
+    // and its created_at would be in the future, which the age clamp floors at
+    // zero — 25 + 16, with the other two terms gone.
+    ASSERT_FALSE(forged.at("queue").empty());
+    EXPECT_DOUBLE_EQ(forged.at("queue").front().at("score").get<double>(), 77.0);
+    EXPECT_DOUBLE_EQ(forged.at("queue").front().at("score_parts").at("importance").get<double>(),
+                     25.0);
+    EXPECT_DOUBLE_EQ(forged.at("queue").front().at("score_parts").at("urgency").get<double>(),
+                     30.0);
+    EXPECT_DOUBLE_EQ(honest.at("queue").front().at("score").get<double>(), 77.0);
 }
 
 TEST(ServicesClockTest, TheClockIsSampledOncePerCall)

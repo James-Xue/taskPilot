@@ -39,6 +39,17 @@
 // Nothing in this file is on a hot path. Each connection is independent, and
 // the only shared mutable state behind the handlers is TaskStore, which
 // serializes its own access.
+//
+// asio's error_code overloads report their result TWICE: they write it into the
+// caller's out parameter and return the same code, because ASIO_SYNC_OP_VOID
+// expands to asio::error_code unless the build defines ASIO_NO_DEPRECATED. This
+// file reads the out parameter, so the returned copy carries nothing new and is
+// dropped with `std::ignore =` rather than left as a bare statement — a bare
+// `call(...);` is indistinguishable from a swallowed error, which is what
+// clang-tidy's bugprone-unused-return-value is right to flag. A plain
+// `static_cast<void>` does NOT satisfy that check (its AllowCastToVoid option
+// defaults to off), and where the out parameter is deliberately not read
+// either, the comment at the call site says why the failure needs no handling.
 
 #include "control/JsonRpcServer.hpp"
 
@@ -53,6 +64,7 @@
 #include <cstddef>
 #include <iostream>
 #include <string>
+#include <tuple>
 #include <utility>
 
 namespace taskpilot
@@ -291,11 +303,11 @@ Status JsonRpcServer::start()
         // accept() cannot be interrupted from another thread on Linux, so the
         // loop polls instead (see acceptLoop).
         asio::error_code option_error;
-        m_acceptor.non_blocking(true, option_error);
+        std::ignore = m_acceptor.non_blocking(true, option_error);
         if (option_error)
         {
             asio::error_code close_error;
-            m_acceptor.close(close_error);
+            std::ignore = m_acceptor.close(close_error);
             return Error::internal("control socket " + m_bindAddress + ":"
                                    + std::to_string(m_port)
                                    + ": cannot switch the acceptor to non-blocking mode: "
@@ -308,7 +320,7 @@ Status JsonRpcServer::start()
         // say — starts from a clean state instead of tripping over the
         // half-open socket this attempt left behind.
         asio::error_code close_error;
-        m_acceptor.close(close_error);
+        std::ignore = m_acceptor.close(close_error);
 
         // The address is reported verbatim: the caller's very next thought is
         // "is a daemon already running?", and an errno would not answer it.
@@ -351,7 +363,7 @@ Status JsonRpcServer::start()
         // the way out.
         m_running.store(false, std::memory_order_release);
         asio::error_code close_error;
-        m_acceptor.close(close_error);
+        std::ignore = m_acceptor.close(close_error);
         return Error::internal("control socket " + m_bindAddress + ":"
                                + std::to_string(m_port)
                                + ": could not start the accept thread: " + e.what());
@@ -384,7 +396,7 @@ void JsonRpcServer::stop()
     //    thread is reading that same state inside accept() — a data race with
     //    no purpose, since nothing needed waking.
     asio::error_code ignored;
-    m_acceptor.close(ignored);
+    std::ignore = m_acceptor.close(ignored);
 
     // 3. Take the session records, then wake every parked read_until with
     //    shutdown(). Deliberately not close(): asio's close() also rewrites
@@ -398,7 +410,8 @@ void JsonRpcServer::stop()
         sessions.swap(m_sessions);
         for (const Session &session : sessions)
         {
-            session.socket->shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
+            std::ignore =
+                session.socket->shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
         }
     }
 
@@ -442,7 +455,7 @@ void JsonRpcServer::acceptLoop()
         auto socket = std::make_shared<asio::ip::tcp::socket>(m_ioCtx);
 
         asio::error_code accept_error;
-        m_acceptor.accept(*socket, accept_error);
+        std::ignore = m_acceptor.accept(*socket, accept_error);
 
         if (accept_error)
         {
@@ -479,8 +492,21 @@ void JsonRpcServer::acceptLoop()
         // that is a platform detail this must not depend on. A non-blocking
         // session socket would return would_block from the first read_until()
         // and end every session at its first request, so set it explicitly.
-        asio::error_code ignored;
-        socket->non_blocking(false, ignored);
+        //
+        // Unlike the teardown closes below, this failure is NOT droppable: the
+        // socket would be served in the one state this call exists to rule out,
+        // and the client would see a disconnect with nothing said about why.
+        // Refuse the connection and say so. The socket dies with this
+        // iteration — no session thread owns it yet, so this thread may drop
+        // the last reference — and the listener keeps serving.
+        asio::error_code nonblocking_error;
+        std::ignore = socket->non_blocking(false, nonblocking_error);
+        if (nonblocking_error)
+        {
+            std::cerr << "taskpilot: control socket cannot make a connection blocking: "
+                      << nonblocking_error.message() << "\n";
+            continue;
+        }
 
         // Register the record under the lock, and note what makes that
         // ordering sufficient:
@@ -522,8 +548,11 @@ void JsonRpcServer::acceptLoop()
             // function calls std::terminate. Nothing was registered, so there
             // is no bookkeeping to undo; close the connection rather than
             // leaving the client waiting on a socket nobody will ever read.
+            // The close's own failure needs no handling: the client is being
+            // dropped either way, and the last reference to the socket dies at
+            // the end of this block.
             asio::error_code close_error;
-            socket->close(close_error);
+            std::ignore = socket->close(close_error);
             std::cerr << "taskpilot: control socket cannot serve a connection: "
                       << e.what() << "\n";
         }
@@ -647,10 +676,14 @@ void JsonRpcServer::handleSession(std::shared_ptr<asio::ip::tcp::socket> socket)
     // shutdown() before close() because a close() with unread data still in the
     // receive queue turns into a reset, and a client being told the daemon is
     // going away deserves an orderly end of stream instead.
+    //
+    // Both failures are deliberately ignored: this is the last statement of the
+    // session, the socket is dropped immediately afterwards, and a client that
+    // reset first has already stopped listening.
     std::lock_guard lock(m_sessionMutex);
     asio::error_code ignored;
-    socket->shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
-    socket->close(ignored);
+    std::ignore = socket->shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
+    std::ignore = socket->close(ignored);
 }
 
 } // namespace taskpilot

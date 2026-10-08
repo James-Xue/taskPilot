@@ -69,6 +69,7 @@
 #include <exception>
 #include <string>
 #include <system_error>
+#include <tuple>
 #include <utility>
 
 namespace taskpilot
@@ -309,9 +310,14 @@ class DeadlineSocket
             // Cancel the step in flight so its handler still fires and run()
             // can return through the normal path. The errors are ignored on
             // purpose: there is nothing useful to do with "the socket was
-            // already closed" while handling a timeout.
+            // already closed" while handling a timeout. `std::ignore` rather
+            // than a bare call because asio's error_code overloads hand the
+            // result back twice — into `ignored` and again as the return value
+            // (ASIO_SYNC_OP_VOID expands to asio::error_code unless the build
+            // defines ASIO_NO_DEPRECATED) — so the drop is visibly deliberate
+            // instead of looking like a swallowed error.
             std::error_code ignored;
-            m_socket.close(ignored);
+            std::ignore = m_socket.close(ignored);
             m_resolver.cancel();
         });
 
