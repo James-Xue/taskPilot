@@ -66,3 +66,21 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# ---------------------------------------------------------------------------
+# taskPilot: build output and runtime data
+# ---------------------------------------------------------------------------
+# Build tree and the artifacts cmake/clangd drop at the top level. run.sh
+# defaults TASKPILOT_BUILD_DIR to build/.
+build/
+.cache/
+compile_commands.json
+.clangd/
+
+# The store run.sh creates (TASKPILOT_DB defaults to data/taskpilot.db). It is
+# personal backlog content, not source, and copying it is the whole backup.
+# The -shm/-wal siblings are SQLite's sidecar files: committing them would put
+# a half-written database in the repo.
+data/*.db
+data/*.db-shm
+data/*.db-wal

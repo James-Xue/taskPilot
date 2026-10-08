@@ -1,0 +1,48 @@
+[Unit]
+# taskPilot — work priority ranking daemon (systemd user unit)
+#
+# Install:
+#   cp deploy/taskpilot.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now taskpilot
+#   loginctl enable-linger "$USER"      # keep it alive across logout, as pulsetrader does
+#
+# Inspect:
+#   systemctl --user status taskpilot
+#   journalctl --user -u taskpilot -f
+#
+# Why a daemon at all: the stdio MCP bridge is spawned fresh by every Claude
+# Code session and exits with it, so the backlog has to live somewhere that
+# outlives a session. That is this process. It also means the MCP bridge never
+# has to own a database, so two sessions can never race on one.
+Description=taskPilot work priority ranking daemon
+Documentation=file:%h/1_Code/02_taskPilot/README.md
+
+# No network dependency is declared: the daemon binds loopback only, and
+# starting earlier means it is already listening before the first MCP tool
+# call arrives.
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/1_Code/02_taskPilot
+
+# The store lives in the repo's data/ directory (gitignored). Run `./run.sh
+# build` once before enabling this, and again after every rebuild — the unit
+# runs the binary, it does not build it.
+Environment=TASKPILOT_DB=%h/1_Code/02_taskPilot/data/taskpilot.db
+ExecStart=%h/1_Code/02_taskPilot/build/taskPilot serve --bind 127.0.0.1 --port 8091
+
+# on-failure, not always: a clean SIGTERM from `systemctl --user stop` should
+# stay stopped. A crash (or a port collision from a stray manual `run.sh serve`)
+# is retried, after a short pause so a bind conflict does not become a spin.
+Restart=on-failure
+RestartSec=3
+
+# The socket has no authentication and binds loopback; the only writable path
+# it needs is its own database.
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
