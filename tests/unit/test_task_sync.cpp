@@ -1,17 +1,26 @@
 // tests/unit/test_task_sync.cpp — the export format and the merge decision
 //
-// Two things are being protected here, and both fail silently in production:
+// Three things are being protected here, and each fails silently in production:
 //
-//   1. The decision table in TaskSync.hpp, every row of it. Its two deliberate
+//   1. The decision table in TaskSync.hpp, every row of it. Its THREE deliberate
 //      asymmetries (a delete beats a same-second edit; a strictly newer edit
-//      resurrects a deletion) are exactly what someone tidying this code would
-//      "simplify" into one comparison — and the damage is a task that reappears
-//      after being deleted, or an edit that vanishes, on a machine nobody is
-//      looking at days later.
+//      resurrects a deletion; an equal-stamp disagreement is broken by content
+//      digest) are exactly what someone tidying this code would "simplify" into
+//      one comparison — and the damage is a task that reappears after being
+//      deleted, an edit that vanishes, or two machines that never converge, on a
+//      machine nobody is looking at days later. The same table's tombstone rows
+//      are where the evidence that a deletion happened is either carried onward
+//      or quietly dropped: a machine that declines to record a tombstone for a
+//      uid it never held reports "clean" while it makes the deletion undoable.
 //   2. The framing invariants of the file: one record per line, no header, one
 //      line per uid, and no key this writer emits that a reader would refuse.
 //      git merges the file line by line, so a violation of any of them turns a
 //      routine merge into either a conflict on every sync or a lost record.
+//   3. The stamp window. A stamp in the wrong UNIT — milliseconds instead of
+//      seconds, the mistake a JSON client actually makes — passes every other
+//      check, is stored verbatim, and then outranks every future local write on
+//      every machine: the task freezes and nothing can ever raise its stamp
+//      again. Nothing about that failure is visible in the record.
 //
 // The parser tests damage exactly one field of an otherwise valid line, so a
 // failure names the property that broke rather than the whole line.
@@ -27,6 +36,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "core/Clock.hpp"
 #include "core/Result.hpp"
 #include "core/Task.hpp"
 #include "core/TaskSync.hpp"
@@ -162,6 +172,29 @@ std::string lineFor(const taskpilot::SyncRecord &record)
 {
     return record.deleted ? taskpilot::toJsonLine(record.uid, record.stamp)
                           : taskpilot::toJsonLine(record.task);
+}
+
+// The local side of a merge for a task this store holds: the stamp it compares
+// with, and the row itself, which is what lets the equal-stamp tie-break look
+// at the content. Both are what TaskStore::lookupLocal hands over.
+taskpilot::LocalState stateFor(const taskpilot::Task &task)
+{
+    taskpilot::LocalState local;
+    local.present = true;
+    local.stamp = task.updated_at;
+    local.task = task;
+    return local;
+}
+
+// The same local state as it arrives from the other machine: a record, with its
+// stamp lifted out of the task exactly as parseJsonLine does it.
+taskpilot::SyncRecord recordFor(const taskpilot::Task &task)
+{
+    taskpilot::SyncRecord record;
+    record.uid = task.uid;
+    record.stamp = task.updated_at;
+    record.task = task;
+    return record;
 }
 
 // One row of the header's merge table.
@@ -602,6 +635,73 @@ TEST(ParseJsonLineTest, RejectsANonBooleanDeletedFlag)
     expectRejectedWith(document.dump(), "'deleted'");
 }
 
+TEST(ParseJsonLineTest, RepairsALiveStampThatCannotBeEpochSeconds)
+{
+    // An implausible stamp is REPAIRED, not refused. Refusing it failed the
+    // whole file (parseJsonl's contract), which took the entire shared backlog
+    // down — and because export_tasks re-parses its own output, it left the one
+    // machine holding the bad row unable to export at all, with no API able to
+    // clear it. The defence survives the repair: the value is pulled inside the
+    // window before it is ever stored, so a millisecond stamp still cannot
+    // outrank real edits.
+    //
+    // Zero is a field that was never filled in, and a negative is a subtraction
+    // that went the wrong way. Neither is a time this program can mean.
+    nlohmann::json zero = minimalLiveDocument();
+    zero["updated_at"] = 0;
+    const taskpilot::SyncRecord clamped_low = parsedOrFail(zero.dump());
+    EXPECT_EQ(taskpilot::kMinPlausibleStamp, clamped_low.stamp);
+    EXPECT_TRUE(clamped_low.stamp_adjusted);
+
+    nlohmann::json negative = minimalLiveDocument();
+    negative["updated_at"] = -1700000500;
+    EXPECT_EQ(taskpilot::kMinPlausibleStamp, parsedOrFail(negative.dump()).stamp);
+
+    // A MILLISECOND value — the mistake that actually happens (Date.now(), a
+    // browser console, a hand-written script). It is pulled back to the upper
+    // bound rather than refused, which is what stops a single such row from
+    // making the whole shared file un-mergeable, and stops it outranking every
+    // future real edit.
+    nlohmann::json milliseconds = minimalLiveDocument();
+    milliseconds["updated_at"] = 1791445376000;
+    const taskpilot::SyncRecord clamped_high = parsedOrFail(milliseconds.dump());
+    // Divided back to the instant the sender meant (1791445376), NOT pinned to
+    // the ceiling: pinning would satisfy the parser while leaving the task
+    // frozen for another 74 years, still outranking every real edit.
+    EXPECT_EQ(std::int64_t{ 1791445376 }, clamped_high.stamp);
+    EXPECT_TRUE(clamped_high.stamp_adjusted);
+
+    // A value in the right unit is NOT touched and NOT flagged: the window must
+    // not quietly rewrite real time.
+    nlohmann::json normal = minimalLiveDocument();
+    normal["updated_at"] = 1700000500;
+    const taskpilot::SyncRecord untouched = parsedOrFail(normal.dump());
+    EXPECT_EQ(std::int64_t{ 1700000500 }, untouched.stamp);
+    EXPECT_FALSE(untouched.stamp_adjusted);
+}
+
+TEST(ParseJsonLineTest, RepairsATombstoneStampThatCannotBeEpochSeconds)
+{
+    // Same repair as the live branch. A frozen tombstone stamp would make the
+    // two machines' exports disagree on that line permanently, which is a git
+    // conflict at every sync — so the window still has to catch it, it just
+    // catches it by clamping instead of by making the file unreadable.
+    nlohmann::json milliseconds = minimalTombstoneDocument();
+    milliseconds["updated_at"] = 1791445376000;
+    const taskpilot::SyncRecord clamped = parsedOrFail(milliseconds.dump());
+    EXPECT_EQ(std::int64_t{ 1791445376 }, clamped.stamp);
+    EXPECT_TRUE(clamped.stamp_adjusted);
+    EXPECT_TRUE(clamped.deleted);
+
+    nlohmann::json zero = minimalTombstoneDocument();
+    zero["updated_at"] = 0;
+    EXPECT_EQ(taskpilot::kMinPlausibleStamp, parsedOrFail(zero.dump()).stamp);
+
+    nlohmann::json negative = minimalTombstoneDocument();
+    negative["updated_at"] = -1;
+    EXPECT_EQ(taskpilot::kMinPlausibleStamp, parsedOrFail(negative.dump()).stamp);
+}
+
 TEST(ParseJsonLineTest, IgnoresUnknownExtraKeys)
 {
     // Forward tolerance, and only of this kind: a newer writer adding a field
@@ -797,7 +897,8 @@ TEST(SyncDecideTest, WalksTheWholeDecisionTable)
     const std::vector<DecideCase> cases{
         // local absent
         { "absent + live", false, false, 0, false, 100, taskpilot::SyncAction::kInsert },
-        { "absent + tombstone", false, false, 0, true, 100, taskpilot::SyncAction::kSkip },
+        { "absent + tombstone", false, false, 0, true, 100,
+          taskpilot::SyncAction::kRecordTombstone },
         // local live
         { "live + live, newer", true, false, 100, false, 101, taskpilot::SyncAction::kUpdate },
         { "live + live, equal", true, false, 100, false, 100, taskpilot::SyncAction::kSkip },
@@ -806,12 +907,16 @@ TEST(SyncDecideTest, WalksTheWholeDecisionTable)
         { "live + tombstone, equal", true, false, 100, true, 100, taskpilot::SyncAction::kDelete },
         { "live + tombstone, older", true, false, 100, true, 99, taskpilot::SyncAction::kSkip },
         // local tombstoned
-        { "tombstoned + live, newer", false, true, 100, false, 101, taskpilot::SyncAction::kResurrect },
+        { "tombstoned + live, newer", false, true, 100, false, 101,
+          taskpilot::SyncAction::kResurrect },
         { "tombstoned + live, equal", false, true, 100, false, 100, taskpilot::SyncAction::kSkip },
         { "tombstoned + live, older", false, true, 100, false, 99, taskpilot::SyncAction::kSkip },
-        { "tombstoned + tombstone, newer", false, true, 100, true, 101, taskpilot::SyncAction::kSkip },
-        { "tombstoned + tombstone, equal", false, true, 100, true, 100, taskpilot::SyncAction::kSkip },
-        { "tombstoned + tombstone, older", false, true, 100, true, 99, taskpilot::SyncAction::kSkip },
+        { "tombstoned + tombstone, newer", false, true, 100, true, 101,
+          taskpilot::SyncAction::kReviseTombstone },
+        { "tombstoned + tombstone, equal", false, true, 100, true, 100,
+          taskpilot::SyncAction::kSkip },
+        { "tombstoned + tombstone, older", false, true, 100, true, 99,
+          taskpilot::SyncAction::kSkip },
     };
 
     for (const DecideCase &row : cases)
@@ -823,9 +928,11 @@ TEST(SyncDecideTest, WalksTheWholeDecisionTable)
         local.tombstoned = row.local_tombstoned;
         local.stamp = row.local_stamp;
 
-        // Only `deleted` and `stamp` are populated: a decision that needed the
-        // task body would be reading something other than the stamps, which is
-        // the one thing the merge rule is allowed to compare.
+        // Only `deleted` and `stamp` are populated: this walk is the STAMP
+        // table. The one row that needs more than the two stamps — an equal
+        // stamp on two live records, which the content decides — is exercised
+        // by the dedicated tests below, and the row here pins the documented
+        // answer for a caller that supplied no local row at all.
         taskpilot::SyncRecord incoming;
         incoming.deleted = row.incoming_deleted;
         incoming.stamp = row.incoming_stamp;
@@ -834,24 +941,128 @@ TEST(SyncDecideTest, WalksTheWholeDecisionTable)
     }
 }
 
-TEST(SyncDecideTest, EqualStampsOnTwoLiveRecordsSkip)
+TEST(SyncDecideTest, ATombstoneForAnUnknownUidIsRecordedNotSkipped)
 {
-    // Asymmetry 1 is about deletes, so the ordinary rule stays strict: equal
-    // stamps mean the machines agree, and the local copy wins. Choosing kUpdate
-    // here would make an unchanged sync report a change on every pass.
+    // The most damaging row in the table, and the one whose damage is invisible
+    // from the machine that causes it. Skipping records nothing; exportJsonl
+    // then writes no line for the uid; git propagates the missing line as a
+    // deletion of the tombstone; and every machine still holding the task (it
+    // has not synced since the delete) learns nothing, keeps it, and
+    // republishes it live. The deletion is undone everywhere while the machine
+    // that dropped the evidence reports "skipped: 1, clean".
+    taskpilot::LocalState local; // absent: neither a row nor a tombstone
+
+    taskpilot::SyncRecord incoming;
+    incoming.deleted = true;
+    incoming.stamp = 1700000600;
+
+    const taskpilot::SyncAction action = taskpilot::decide(local, incoming);
+
+    // Asserted on its own line for the reason this case exists: a regression
+    // here reads as "the evidence was dropped", not as "some other action came
+    // back".
+    EXPECT_NE(taskpilot::SyncAction::kSkip, action);
+    EXPECT_EQ(taskpilot::SyncAction::kRecordTombstone, action);
+}
+
+TEST(SyncDecideTest, TombstoneAgainstTombstoneTakesTheStrictlyNewerStamp)
+{
+    // Two machines each deleted the same task locally, in their own second. A
+    // tombstone's stamp is otherwise written once and never revised — only
+    // deleting a LIVE row writes one, and a second delete of the same uid is
+    // kNotFound — so without this branch the two stamps could never be
+    // reconciled: the exports would differ on that line permanently, and git
+    // would conflict on it at every sync.
+    taskpilot::LocalState local;
+    local.tombstoned = true;
+    local.stamp = 1700000600;
+
+    taskpilot::SyncRecord incoming;
+    incoming.deleted = true;
+
+    incoming.stamp = 1700000601;
+    EXPECT_EQ(taskpilot::SyncAction::kReviseTombstone, taskpilot::decide(local, incoming));
+
+    // Equal and older have nothing to write: the stamp we hold already IS the
+    // later write, and re-writing it would make every merge report a change.
+    incoming.stamp = 1700000600;
+    EXPECT_EQ(taskpilot::SyncAction::kSkip, taskpilot::decide(local, incoming));
+
+    incoming.stamp = 1700000599;
+    EXPECT_EQ(taskpilot::SyncAction::kSkip, taskpilot::decide(local, incoming));
+}
+
+TEST(SyncDecideTest, AnEqualStampIsBrokenByContentInBothDirections)
+{
+    // Two edits of one task made inside the same epoch second: the stamps are
+    // equal, so the timestamps carry no ordering at all, and neither record's
+    // stamp will ever rise on its own. Skipping would leave each machine
+    // holding its own copy forever while the merge reported "clean".
+    taskpilot::Task alpha = makeTask();
+    alpha.title = "edited on one machine";
+    taskpilot::Task beta = makeTask();
+    beta.title = "edited on the other machine";
+    beta.updated_at = alpha.updated_at; // the premise: one second, two edits
+
+    const std::string alpha_digest = taskpilot::contentDigest(alpha);
+    const std::string beta_digest = taskpilot::contentDigest(beta);
+    ASSERT_NE(alpha_digest, beta_digest) << "the pair must disagree";
+
+    // Named by digest rather than by title, so the expectation describes the
+    // RULE (the larger digest wins) instead of which title happens to hash
+    // above the other.
+    const taskpilot::Task &larger = (beta_digest > alpha_digest) ? beta : alpha;
+    const taskpilot::Task &smaller = (beta_digest > alpha_digest) ? alpha : beta;
+
+    // The machine holding the smaller record adopts the larger one...
+    EXPECT_EQ(taskpilot::SyncAction::kUpdate,
+              taskpilot::decide(stateFor(smaller), recordFor(larger)));
+
+    // ...and the machine holding the larger record keeps it. Both directions
+    // are asserted because both machines run the same comparison on the same
+    // pair: exactly one copy wins, and it is the SAME copy on both of them.
+    // Two winners, or none, would mean the two machines swap or deadlock
+    // instead of converging.
+    EXPECT_EQ(taskpilot::SyncAction::kSkip,
+              taskpilot::decide(stateFor(larger), recordFor(smaller)));
+}
+
+TEST(SyncDecideTest, AnEqualStampWithEqualContentSkips)
+{
+    // Equal stamps and equal content is the ordinary case — the two machines
+    // agree — and it must stay a skip, or every merge would rewrite records
+    // nobody changed and MergeReport::clean() would never be true.
+    taskpilot::Task task = makeTask();
+    taskpilot::Task same = task;
+    same.id = task.id + 1; // the local row number is not content (see the digest tests)
+
+    EXPECT_EQ(taskpilot::contentDigest(task), taskpilot::contentDigest(same));
+    EXPECT_EQ(taskpilot::SyncAction::kSkip, taskpilot::decide(stateFor(task), recordFor(same)));
+}
+
+TEST(SyncDecideTest, AnEqualStampWithNoLocalRowSuppliedSkips)
+{
+    // LocalState::task is the only way decide() can see our copy's content, and
+    // a caller that supplied none cannot answer the content question. Keeping
+    // our copy is the conservative answer: treating "unknown" as "different"
+    // would make each machine adopt the other's equal-stamp record on every
+    // merge, so the two would swap copies forever and no merge would ever come
+    // out clean.
     taskpilot::LocalState local;
     local.present = true;
     local.stamp = 1700000500;
+    // local.task deliberately left default: an empty uid means "no row handed
+    // over", which a stored task can never be.
 
-    taskpilot::SyncRecord incoming;
-    incoming.stamp = 1700000500;
+    taskpilot::SyncRecord incoming = recordFor(makeTask());
+    ASSERT_EQ(local.stamp, incoming.stamp);
 
     EXPECT_EQ(taskpilot::SyncAction::kSkip, taskpilot::decide(local, incoming));
 }
 
 TEST(SyncDecideTest, ADeleteBeatsALiveRecordAtTheSameStamp)
 {
-    // Asymmetry 1 of 2, explicitly. `>=`, not `>`: a delete beats an edit made
+    // Asymmetry 1 of 3, explicitly. `>=`, not `>`: a delete beats an edit made
     // in the same second, because a task reappearing after the user deleted it
     // reads as the tool ignoring an instruction, while an edit lost to a
     // same-second delete can be retyped.
@@ -868,10 +1079,10 @@ TEST(SyncDecideTest, ADeleteBeatsALiveRecordAtTheSameStamp)
 
 TEST(SyncDecideTest, EqualStampsDoNotResurrect)
 {
-    // Asymmetry 2 of 2, and the mirror of the test above: a tie here means our
+    // Asymmetry 2 of 3, and the mirror of the test above: a tie here means our
     // delete stands, so the two equal-stamp cases resolve the same way — toward
-    // the deletion. If this returned kResurrect, the two asymmetries would
-    // contradict each other and a sync between two machines would oscillate.
+    // the deletion. If this returned kResurrect, a sync between two machines
+    // would oscillate.
     taskpilot::LocalState local;
     local.tombstoned = true;
     local.stamp = 1700000500;
@@ -897,20 +1108,6 @@ TEST(SyncDecideTest, AOneSecondNewerEditResurrects)
     EXPECT_EQ(taskpilot::SyncAction::kResurrect, taskpilot::decide(local, incoming));
 }
 
-TEST(SyncDecideTest, ADeleteForATaskWeNeverHadIsANoOp)
-{
-    // Not kInsert: a tombstone carries no task, so inserting would create an
-    // empty one. Not kDelete either — there is nothing to remove, and counting
-    // it would report a deletion on machines that never held the task.
-    taskpilot::LocalState local;
-
-    taskpilot::SyncRecord incoming;
-    incoming.deleted = true;
-    incoming.stamp = 1700000500;
-
-    EXPECT_EQ(taskpilot::SyncAction::kSkip, taskpilot::decide(local, incoming));
-}
-
 // ---------------------------------------------------------------------------
 // The two halves agreeing: what is written is what is read
 // ---------------------------------------------------------------------------
@@ -926,12 +1123,72 @@ TEST(TaskSyncIntegrationTest, ALiveLineAndItsTombstoneDecideInFavourOfTheDelete)
     const taskpilot::SyncRecord tombstone =
         parsedOrFail(taskpilot::toJsonLine(task.uid, task.updated_at));
 
-    taskpilot::LocalState local;
-    local.present = true;
-    local.stamp = live.stamp;
+    // The local row is handed over, so the second expectation below is the
+    // equal-content answer and not the no-local-row fallback.
+    taskpilot::LocalState local = stateFor(task);
+    ASSERT_EQ(live.stamp, local.stamp);
 
     EXPECT_EQ(taskpilot::SyncAction::kDelete, taskpilot::decide(local, tombstone));
     EXPECT_EQ(taskpilot::SyncAction::kSkip, taskpilot::decide(local, live));
+}
+
+TEST(TaskSyncIntegrationTest, ATombstoneForAnUnknownUidIsCarriedOnward)
+{
+    // The critical row, end to end: the tombstone really is what the wire
+    // carries, and a machine that never held the task must record it, because
+    // its own export is the only thing that can go on telling the machines
+    // which still hold the task that it was deleted.
+    const taskpilot::SyncRecord tombstone =
+        parsedOrFail(taskpilot::toJsonLine(kUidB, 1700009999));
+
+    taskpilot::LocalState never_held_it; // neither a row nor a tombstone
+
+    const taskpilot::SyncAction action = taskpilot::decide(never_held_it, tombstone);
+    EXPECT_NE(taskpilot::SyncAction::kSkip, action);
+    EXPECT_EQ(taskpilot::SyncAction::kRecordTombstone, action);
+}
+
+TEST(TaskSyncIntegrationTest, ASameSecondEditOnTwoMachinesConvergesOnOneCopy)
+{
+    // Both edits round-tripped through the wire format, as a merge does them.
+    // The two machines must decide in OPPOSITE directions on the same pair:
+    // exactly one copy wins, the same one on both sides, and which one is
+    // decided by the digest rather than by which machine is asking. Anything
+    // else — two winners, or none — is the permanent fork this rule exists to
+    // close, and it is invisible in a report that calls both merges clean.
+    taskpilot::Task on_this_machine = makeTask();
+    on_this_machine.title = "edited on this machine";
+    taskpilot::Task on_the_other_machine = makeTask();
+    on_the_other_machine.title = "edited on the other machine";
+    ASSERT_EQ(on_this_machine.updated_at, on_the_other_machine.updated_at);
+
+    const taskpilot::SyncRecord here = parsedOrFail(taskpilot::toJsonLine(on_this_machine));
+    const taskpilot::SyncRecord there = parsedOrFail(taskpilot::toJsonLine(on_the_other_machine));
+
+    taskpilot::LocalState local_here;
+    local_here.present = true;
+    local_here.stamp = here.stamp;
+    local_here.task = here.task;
+
+    taskpilot::LocalState local_there;
+    local_there.present = true;
+    local_there.stamp = there.stamp;
+    local_there.task = there.task;
+
+    const taskpilot::SyncAction this_machine = taskpilot::decide(local_here, there);
+    const taskpilot::SyncAction other_machine = taskpilot::decide(local_there, here);
+
+    const bool this_machine_adopts = (taskpilot::SyncAction::kUpdate == this_machine);
+    EXPECT_TRUE(this_machine_adopts || (taskpilot::SyncAction::kUpdate == other_machine))
+        << "neither machine adopted the other's copy: they stay forked";
+    EXPECT_FALSE(this_machine_adopts && (taskpilot::SyncAction::kUpdate == other_machine))
+        << "both machines adopted the other's copy: they would swap forever";
+
+    // Whichever direction this machine chose, the other one chose the mirror of
+    // it — the assertion that makes the outcome convergence rather than an
+    // agreement to differ.
+    EXPECT_EQ(this_machine_adopts ? taskpilot::SyncAction::kSkip : taskpilot::SyncAction::kUpdate,
+              other_machine);
 }
 
 TEST(TaskSyncIntegrationTest, ALaterEditInTheSameFileWinsOverAnEarlierOne)
@@ -949,7 +1206,214 @@ TEST(TaskSyncIntegrationTest, ALaterEditInTheSameFileWinsOverAnEarlierOne)
     taskpilot::LocalState local;
     local.present = true;
     local.stamp = older.stamp;
+    local.task = older.task;
 
     EXPECT_EQ(taskpilot::SyncAction::kUpdate, taskpilot::decide(local, newer));
+
+    // The second line repeats the first one's uid at the same stamp, and here
+    // the content is genuinely identical — so this is a skip for the right
+    // reason (equal digests), not only because a local row was missing.
     EXPECT_EQ(taskpilot::SyncAction::kSkip, taskpilot::decide(local, older));
+}
+
+// ---------------------------------------------------------------------------
+// contentDigest: what the tie-break is allowed to depend on
+// ---------------------------------------------------------------------------
+
+TEST(ContentDigestTest, IsDeterministicAndFixedWidthLowercaseHex)
+{
+    const taskpilot::Task task = makeTask();
+
+    const std::string first = taskpilot::contentDigest(task);
+    EXPECT_EQ(first, taskpilot::contentDigest(task));
+
+    // decide() compares two digests as STRINGS, and a fixed-width lowercase
+    // rendering is what makes that comparison the same order as comparing the
+    // 64-bit values: without it, "the larger digest wins" would order by first
+    // character instead of by leading zero.
+    EXPECT_EQ(std::size_t{ 16 }, first.size());
+    for (const char character : first)
+    {
+        const bool is_digit = character >= '0' && character <= '9';
+        const bool is_lowercase_hex_letter = character >= 'a' && character <= 'f';
+        EXPECT_TRUE(is_digit || is_lowercase_hex_letter) << "not lowercase hex: " << first;
+    }
+}
+
+TEST(ContentDigestTest, ChangesForEveryFieldAMergeCarries)
+{
+    const taskpilot::Task base = makeTask();
+
+    // One field at a time, each from the pristine base, so a field left out of
+    // the digest is named by the case that catches it instead of hiding behind a
+    // comparison of two whole records.
+    const auto expect_change = [&base](const taskpilot::Task &mutated, const std::string &what)
+    {
+        EXPECT_NE(taskpilot::contentDigest(base), taskpilot::contentDigest(mutated)) << what;
+    };
+
+    taskpilot::Task mutated = base;
+    mutated.uid = kUidC;
+    expect_change(mutated, "uid");
+
+    mutated = base;
+    mutated.title += " (edited)";
+    expect_change(mutated, "title");
+
+    mutated = base;
+    mutated.notes += " (edited)";
+    expect_change(mutated, "notes");
+
+    mutated = base;
+    mutated.notes.clear();
+    expect_change(mutated, "notes emptied");
+
+    mutated = base;
+    mutated.status = taskpilot::TaskStatus::kDone;
+    expect_change(mutated, "status");
+
+    mutated = base;
+    mutated.importance = base.importance - 1;
+    expect_change(mutated, "importance");
+
+    mutated = base;
+    mutated.due_at.reset();
+    expect_change(mutated, "due_at unset");
+
+    mutated = base;
+    mutated.due_at = *base.due_at + 1;
+    expect_change(mutated, "due_at moved");
+
+    mutated = base;
+    mutated.blocks = base.blocks + 1;
+    expect_change(mutated, "blocks");
+
+    mutated = base;
+    mutated.tags = { "sync" };
+    expect_change(mutated, "tags shortened");
+
+    mutated = base;
+    mutated.tags = { "sync", "p1", "p2" };
+    expect_change(mutated, "tags extended");
+
+    mutated = base;
+    mutated.tags = {};
+    expect_change(mutated, "tags emptied");
+
+    mutated = base;
+    mutated.created_at = base.created_at + 1;
+    expect_change(mutated, "created_at");
+
+    mutated = base;
+    mutated.updated_at = base.updated_at + 1;
+    expect_change(mutated, "updated_at");
+
+    mutated = base;
+    mutated.completed_at = base.updated_at;
+    expect_change(mutated, "completed_at set");
+
+    // The one field that must NOT matter. `id` is a local row number that a
+    // merge never transports, so a digest that moved when a row was renumbered
+    // would make the same record digest differently on the two machines — and
+    // the tie-break, which both sides compute independently, would turn on
+    // nothing.
+    mutated = base;
+    mutated.id = base.id + 1;
+    EXPECT_EQ(taskpilot::contentDigest(base), taskpilot::contentDigest(mutated)) << "id";
+}
+
+TEST(ContentDigestTest, AnUnsetOptionalDoesNotDigestLikeZero)
+{
+    // "No deadline" and "a deadline at the epoch" are different records, and the
+    // merge rule's promise that a content difference is detected rests on the
+    // digest telling them apart. Same for the completion stamp.
+    taskpilot::Task unset = makeTask();
+    unset.due_at.reset();
+    unset.completed_at.reset();
+
+    taskpilot::Task zero = unset;
+    zero.due_at = 0;
+    EXPECT_NE(taskpilot::contentDigest(unset), taskpilot::contentDigest(zero)) << "due_at";
+
+    taskpilot::Task zero_completed = unset;
+    zero_completed.completed_at = 0;
+    EXPECT_NE(taskpilot::contentDigest(unset), taskpilot::contentDigest(zero_completed))
+        << "completed_at";
+}
+
+TEST(ContentDigestTest, ContentCannotImitateAFieldBoundary)
+{
+    // The encoding has to be unambiguous for EVERY input, not only for the ones
+    // a person types: title, notes and tags are free text, and a tag may contain
+    // a comma, a colon or anything else. If a value could stand in for a value
+    // plus the start of the next field, two different records would digest
+    // alike — and two records that digest alike are, to the tie-break, the same
+    // record, so one machine would keep an edit the other believes is already
+    // there.
+    //
+    // Both pairs below are the same bytes under a delimiter-joined encoding and
+    // different records under the length-prefixed one the implementation uses.
+    taskpilot::Task split_at_the_colon = makeTask();
+    split_at_the_colon.title = "a:b";
+    split_at_the_colon.notes = "";
+    taskpilot::Task split_after_the_colon = makeTask();
+    split_after_the_colon.title = "a";
+    split_after_the_colon.notes = "b:";
+    EXPECT_NE(taskpilot::contentDigest(split_at_the_colon),
+              taskpilot::contentDigest(split_after_the_colon))
+        << "title/notes boundary";
+
+    taskpilot::Task one_tag = makeTask();
+    one_tag.tags = { "a:b", "c" };
+    taskpilot::Task two_tags = makeTask();
+    two_tags.tags = { "a", "b:c" };
+    EXPECT_NE(taskpilot::contentDigest(one_tag), taskpilot::contentDigest(two_tags))
+        << "between two tags";
+}
+
+// ---------------------------------------------------------------------------
+// isPlausibleStamp: the unit check, and the clock it is measured against
+// ---------------------------------------------------------------------------
+
+TEST(StampPlausibilityTest, RefusesValuesThatCannotBeEpochSeconds)
+{
+    // MILLISECONDS, the mistake that will actually happen: this value is about
+    // 2026-10-08 expressed in milliseconds, where the same instant in seconds is
+    // 1791445376. It is ~1000x too large, so the window refuses it — and a
+    // stamp that got through here would outrank every future local write.
+    EXPECT_FALSE(taskpilot::isPlausibleStamp(1791445376000));
+
+    // 0 (a field that was never filled in), a negative (a subtraction that went
+    // the wrong way), and the second before the lower bound.
+    EXPECT_FALSE(taskpilot::isPlausibleStamp(0));
+    EXPECT_FALSE(taskpilot::isPlausibleStamp(-1));
+    EXPECT_FALSE(taskpilot::isPlausibleStamp(taskpilot::kMinPlausibleStamp - 1));
+
+    // The bounds themselves are inside the window, and an ordinary seconds
+    // value from 2023 clearly is too.
+    EXPECT_TRUE(taskpilot::isPlausibleStamp(taskpilot::kMinPlausibleStamp));
+    EXPECT_TRUE(taskpilot::isPlausibleStamp(1700000500));
+
+    // The upper bound is relative to the local clock, and it has to stay wide
+    // enough that a merely skewed clock is not "implausible": a minute of
+    // margin on each side of it keeps this from being flaky when a second ticks
+    // over between the two reads.
+    // BOTH bounds are constants, so the verdict is a property of the RECORD and
+    // not of whoever read it. It used to be relative to the local clock, which
+    // meant a machine more than a year out refused every peer's file and had
+    // every one of its own refused — one wrong clock stopping the backlog in one
+    // direction, while this file's header promises the merge answers from the
+    // records alone.
+    EXPECT_TRUE(taskpilot::isPlausibleStamp(taskpilot::kMinPlausibleStamp));
+    EXPECT_TRUE(taskpilot::isPlausibleStamp(taskpilot::kMaxPlausibleStamp));
+    EXPECT_FALSE(taskpilot::isPlausibleStamp(taskpilot::kMinPlausibleStamp - 1));
+    EXPECT_FALSE(taskpilot::isPlausibleStamp(taskpilot::kMaxPlausibleStamp + 1));
+
+    // A clock that is wildly wrong is NOT what this window polices: only a wrong
+    // UNIT (~1000x, i.e. milliseconds) lands outside it.
+    const taskpilot::SystemClock clock;
+    const std::int64_t now = clock.nowEpochSeconds();
+    EXPECT_TRUE(taskpilot::isPlausibleStamp(now));
+    EXPECT_TRUE(taskpilot::isPlausibleStamp(now + (366LL * 24 * 3600)));
+    EXPECT_FALSE(taskpilot::isPlausibleStamp(now * 1000));
 }

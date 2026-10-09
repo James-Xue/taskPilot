@@ -8,14 +8,19 @@
 //     a named kInvalidArgument. There is no best-effort mode, because a lenient
 //     parser is how a corrupt line becomes silent data loss — a record whose
 //     fields were quietly dropped looks exactly like a record the other machine
-//     meant to send that way.
-//   - decide() compares two stamps and nothing else. It never reads a clock, so
-//     the same pair of files merged in either direction reaches the same answer
-//     on both machines; that is what makes the merge idempotent rather than
-//     something that has to be run in a particular order.
+//     meant to send that way. It is also the only place in this file that reads
+//     the clock, and only to check a transported stamp's UNIT
+//     (isPlausibleStamp): a stamp in the wrong unit passes every other check
+//     here, and then outranks every future local write forever.
+//   - decide() orders two records by STAMP and breaks a stamp tie by CONTENT
+//     (asymmetry 3 in the header). It never reads a clock: the same two records
+//     produce the same answer on both machines, because the tie-break digest is
+//     computed from the records alone. That is what makes the merge idempotent
+//     and convergent rather than something that has to be run in a particular
+//     order.
 //
-// Neither function touches SQLite, the filesystem or the clock; the store owns
-// all three (TaskStore::exportJsonl / mergeJsonl).
+// Neither function touches SQLite or the filesystem; the store owns both
+// (TaskStore::exportJsonl / mergeJsonl).
 
 #include "core/TaskSync.hpp"
 
@@ -29,6 +34,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "core/Clock.hpp"
 #include "core/Result.hpp"
 #include "core/Task.hpp"
 #include "core/Uuid.hpp"
@@ -139,6 +145,109 @@ namespace
     }
 
     return static_cast<int>(wide.value());
+}
+
+// ---------------------------------------------------------------------------
+// Content digest (see contentDigest in the header)
+// ---------------------------------------------------------------------------
+
+// The 64-bit FNV-1a parameters. Any deterministic byte mix would do; FNV-1a is
+// short enough to read in full and needs no table.
+constexpr std::uint64_t kFnvOffsetBasis{ 0xcbf29ce484222325ULL };
+constexpr std::uint64_t kFnvPrime{ 0x100000001b3ULL };
+
+// Fold one byte into a running FNV-1a state.
+//
+// The byte is read as UNSIGNED, not as a plain `char`: `char` is signed on
+// x86 and a byte >= 0x80 would sign-extend, so the same UTF-8 title would
+// digest differently on two platforms. The digest has to be identical on both
+// machines or the tie-break picks its winner differently on each of them.
+void mixByte(std::uint64_t &hash, char byte)
+{
+    hash ^= static_cast<std::uint64_t>(static_cast<unsigned char>(byte));
+    hash *= kFnvPrime;
+}
+
+// Fold a string as its length, a ':' and then its bytes.
+//
+// Length-prefixed rather than delimiter-joined: title, notes and tags are user
+// text and may contain any byte at all, so a delimiter would let one value
+// mimic the end of another — the pair title "a:b" with empty notes against
+// title "a" with notes "b:" is the same run of bytes under a delimiter, and two
+// byte-identical digest inputs are two records the tie-break believes are
+// equal. With the length in front, the encoding is unambiguous for every input,
+// which is what makes the digest a function of the content rather than of where
+// a colon happened to land.
+void mixText(std::uint64_t &hash, const std::string &text)
+{
+    for (const char digit : std::to_string(text.size()))
+    {
+        mixByte(hash, digit);
+    }
+
+    mixByte(hash, ':');
+
+    for (const char byte : text)
+    {
+        mixByte(hash, byte);
+    }
+}
+
+// Fold a nullable timestamp.
+//
+// Absence gets its own marker rather than being folded as nothing at all: an
+// unset deadline and a deadline of 0 are different records (0 is a real, if
+// unwise, epoch stamp), and the merge rule promises that records which differ
+// only in whether an optional is set do not digest alike.
+void mixOptional(std::uint64_t &hash, const std::optional<std::int64_t> &value)
+{
+    if (!value.has_value())
+    {
+        mixText(hash, "unset");
+        return;
+    }
+
+    mixText(hash, "set");
+    mixText(hash, std::to_string(*value));
+}
+
+// Fold a tag list: the count, then each tag.
+//
+// The count is redundant with the per-tag lengths — the stream stays decodable
+// without it — but it keeps a dump of the mixed bytes readable, and it makes
+// the empty list's contribution explicit.
+void mixTags(std::uint64_t &hash, const std::vector<std::string> &tags)
+{
+    mixText(hash, std::to_string(tags.size()));
+
+    for (const std::string &tag : tags)
+    {
+        mixText(hash, tag);
+    }
+}
+
+// Render a 64-bit digest as exactly 16 lowercase hex characters.
+//
+// The fixed WIDTH matters, and not only for looks: decide() compares the two
+// digests as STRINGS, and a fixed-width lowercase rendering is the one spelling
+// where the string order is also the numeric order. A variable-width rendering
+// ("f0…" against "0f…") would order by first character rather than by leading
+// zero, and "the larger digest wins" would then mean something a reader of the
+// rule would not recognise.
+[[nodiscard]] std::string hexDigest(std::uint64_t value)
+{
+    constexpr std::size_t kHexDigits{ 16 };
+    constexpr char kDigits[]{ "0123456789abcdef" };
+
+    std::string text(kHexDigits, '0');
+    for (std::size_t position = 0; position < kHexDigits; ++position)
+    {
+        const std::size_t nibble_index = kHexDigits - 1 - position;
+        const std::uint64_t nibble = (value >> (nibble_index * 4)) & 0xFULL;
+        text[position] = kDigits[static_cast<std::size_t>(nibble)];
+    }
+
+    return text;
 }
 
 } // namespace
@@ -345,15 +454,32 @@ Result<SyncRecord> parseJsonLine(const std::string &line)
         // Only the stamp is checked, because only the stamp is read. The task
         // fields a tombstone does not carry are not merely absent, they are
         // meaningless (see SyncRecord), so record.task is left default.
-        const Result<std::int64_t> stamp = requireInt64(document, "tombstone " + record.uid,
-                                                        "updated_at");
+        const std::string what = "tombstone " + record.uid;
+        const Result<std::int64_t> stamp = requireInt64(document, what, "updated_at");
         if (!stamp.ok())
         {
             return stamp.error();
         }
 
+        // The stamp's UNIT is checked, not only its type. A stamp in the wrong
+        // unit is worse than a corrupt one: every other check here accepts it,
+        // the store writes it verbatim, and it then outranks every future local
+        // write — the task freezes, because each edit on every machine loses the
+        // comparison and is skipped as "older" forever. MILLISECONDS are the
+        // mistake that actually happens (Date.now(), a browser console, a
+        // hand-written script), and a millisecond tombstone would in addition
+        // make the two machines' exports disagree on that line permanently.
+        // REPAIRED, not refused. A refusal here is whole-file (parseJsonl's
+        // contract), so one bad stamp made the entire shared backlog
+        // un-mergeable — and, because export_tasks re-parses its own output,
+        // un-EXPORTABLE on the machine that held it, with no API able to clear
+        // it. See clampPlausibleStamp in the header for the full chain. The
+        // defence survives the repair: the value is pulled inside the window
+        // before it is ever stored, so a millisecond stamp still cannot outrank
+        // real edits.
         record.deleted = true;
-        record.stamp = stamp.value();
+        record.stamp_adjusted = !isPlausibleStamp(stamp.value());
+        record.stamp = clampPlausibleStamp(stamp.value());
         return record;
     }
 
@@ -421,6 +547,17 @@ Result<SyncRecord> parseJsonLine(const std::string &line)
     {
         return updated_at.error();
     }
+
+    // The unit as well as the type — see the tombstone branch above for why a
+    // wrong unit is the failure this parser cannot afford to let through. The
+    // stamp is what decide() compares, so a frozen or absurd one silently
+    // outranks real edits on every machine for as long as the record exists.
+    // Repaired rather than refused — see the tombstone branch above and
+    // clampPlausibleStamp in the header. The record is flagged so the merge can
+    // count the repair: a peer or a client sending timestamps in the wrong unit
+    // is a bug worth surfacing, just not one worth losing the backlog over.
+    record.stamp_adjusted = !isPlausibleStamp(updated_at.value());
+    const std::int64_t stamp_value = clampPlausibleStamp(updated_at.value());
 
     if (!document.contains("tags"))
     {
@@ -494,12 +631,13 @@ Result<SyncRecord> parseJsonLine(const std::string &line)
     record.task.importance = importance.value();
     record.task.blocks = blocks.value();
     record.task.created_at = created_at.value();
-    record.task.updated_at = updated_at.value();
+    record.task.updated_at = stamp_value;
     record.task.tags = std::move(tags);
 
-    // The stamp is updated_at's value, kept as its own field so decide() never
-    // has to know whether it is looking at a task or at a tombstone.
-    record.stamp = updated_at.value();
+    // The stamp is updated_at's value (repaired if it arrived out of window),
+    // kept as its own field so decide() never has to know whether it is looking
+    // at a task or at a tombstone.
+    record.stamp = stamp_value;
 
     return record;
 }
@@ -554,7 +692,142 @@ Result<std::vector<SyncRecord>> parseJsonl(const std::string &jsonl)
     return records;
 }
 
-// The merge rule — the header's table, compared in the order it is written.
+// ---------------------------------------------------------------------------
+// The content digest: the tie-break's only input
+// ---------------------------------------------------------------------------
+
+// A canonical digest of everything a merge carries (see the header for what
+// "canonical" has to mean, and why a non-cryptographic mix is enough).
+std::string contentDigest(const Task &task)
+{
+    // FNV-1a, deliberately not a cryptographic hash: this orders two records
+    // that already disagree at one stamp, and a collision would only make them
+    // look equal — which is the behaviour that exists today, not a new failure.
+    // Nothing here is a security boundary, so unpredictability would buy
+    // nothing.
+    //
+    // The field ORDER below is part of the contract between machines and must
+    // never be rearranged: each side computes its own record's digest and then
+    // compares, so a revision that encoded the fields in a different order
+    // would make the two machines choose different winners and fork exactly
+    // where the tie-break promised to converge.
+    std::uint64_t hash = kFnvOffsetBasis;
+
+    // 1. Identity. The merge matches on the uid, so it is covered like every
+    //    other field a record carries.
+    mixText(hash, task.uid);
+
+    // 2. The text a person edited. Empty values are folded with their length
+    //    prefix like any other, so "empty" still contributes and cannot be
+    //    confused with a field that was never written.
+    mixText(hash, task.title);
+    mixText(hash, task.notes);
+
+    // 3. Status by its WIRE NAME, never its ordinal — renumbering the enum
+    //    would otherwise change the digest of every unchanged record on the
+    //    machine that was rebuilt (Task.cpp keeps the wire names stable for the
+    //    same reason).
+    mixText(hash, toString(task.status));
+
+    // 4. The ranking fields, including the nullable deadline, where absence has
+    //    a marker of its own (see mixOptional).
+    mixText(hash, std::to_string(task.importance));
+    mixOptional(hash, task.due_at);
+    mixText(hash, std::to_string(task.blocks));
+    mixTags(hash, task.tags);
+
+    // 5. The timestamps a merge carries.
+    mixText(hash, std::to_string(task.created_at));
+    mixText(hash, std::to_string(task.updated_at));
+    mixOptional(hash, task.completed_at);
+
+    // `id` is DELIBERATELY absent, and this is the one omission worth stating:
+    // it is the only Task field a merge never transports (Task.hpp: it means
+    // "the ninth row THIS database created"). Folding it would make the same
+    // logical record digest differently on the two machines — a real row number
+    // in one store's local copy, 0 in the record that arrived from the other —
+    // so the tie-break, which both sides compute independently, would turn on a
+    // field that means nothing across machines. A digest that changes when a
+    // row is renumbered is not a digest of content.
+
+    return hexDigest(hash);
+}
+
+// ---------------------------------------------------------------------------
+// The stamp window
+// ---------------------------------------------------------------------------
+
+// Could `stamp` be epoch SECONDS? The header carries the reasoning; these are
+// the two bounds it names, and BOTH ARE CONSTANTS.
+bool isPlausibleStamp(std::int64_t stamp)
+{
+    // 1. Not before 2001-09-09. Nothing this program or any client of it can
+    //    mean lands below the bound; what does land there is 0 (a field that
+    //    was never filled in), a negative (a subtraction that went the wrong
+    //    way), a two-digit year, or seconds-since-boot — every one of them a
+    //    value that would mis-order against real stamps forever.
+    if (kMinPlausibleStamp > stamp)
+    {
+        return false;
+    }
+
+    // 2. Not past 2100-01-01. This is the bound that earns its keep, because the
+    //    mistake that actually happens is a WRONG UNIT rather than a typo:
+    //    MILLISECONDS instead of seconds are about 1000x too large — 1.79e12
+    //    where the true count today is 1.79e9 — and arrive from any client that
+    //    calls Date.now(), from a line edited in a browser console, or from a
+    //    hand-written script. A millisecond stamp passes every other check in
+    //    this file, is stored verbatim, and then outranks every future local
+    //    write: each edit on every machine is skipped as "older", so the task
+    //    freezes and nothing ever raises its stamp again.
+    //
+    //    It used to be "not more than a year ahead of the LOCAL clock", which
+    //    made the verdict depend on the READER. That turned the check into a
+    //    clock-quality test with a whole-file blast radius: a machine whose
+    //    clock was more than a year out had its entire export refused by every
+    //    peer, and refused every peer's file, so one wrong clock stopped the
+    //    backlog moving in one direction — while this file's own header promises
+    //    the merge answers from the records alone. A constant cannot do that.
+    return kMaxPlausibleStamp >= stamp;
+}
+
+// Pull `stamp` inside the window. The header explains why the parser repairs
+// instead of refusing; this is the repair.
+std::int64_t clampPlausibleStamp(std::int64_t stamp)
+{
+    if (kMinPlausibleStamp > stamp)
+    {
+        return kMinPlausibleStamp;
+    }
+    if (kMaxPlausibleStamp >= stamp)
+    {
+        return stamp;
+    }
+
+    // Above the window. The overwhelmingly likely cause is MILLISECONDS, and the
+    // honest repair is to undo the UNIT ERROR rather than to pin the value to the
+    // ceiling: pinning would satisfy the parser while leaving the task frozen for
+    // another 74 years, still outranking every real edit made anywhere. Dividing
+    // by 1000 recovers the instant the sender actually meant, so a client that
+    // called Date.now() is corrected rather than merely contained.
+    const std::int64_t as_seconds = stamp / 1000;
+    if (kMinPlausibleStamp <= as_seconds && kMaxPlausibleStamp >= as_seconds)
+    {
+        return as_seconds;
+    }
+
+    // Neither seconds nor a recognisable millisecond value: nothing can be
+    // recovered, so sit on the ceiling. The record is still imported (dropping
+    // it would be the data loss this whole path exists to avoid) and the merge
+    // reports the adjustment.
+    return kMaxPlausibleStamp;
+}
+
+// ---------------------------------------------------------------------------
+// The merge rule
+// ---------------------------------------------------------------------------
+
+// The header's table, compared in the order it is written.
 //
 // `absent` is the only state with neither flag set. A store holding BOTH a row
 // and a tombstone for one uid is out of contract (deleteTask removes the row,
@@ -563,46 +836,110 @@ Result<std::vector<SyncRecord>> parseJsonl(const std::string &jsonl)
 // tombstone is bookkeeping.
 SyncAction decide(const LocalState &local, const SyncRecord &incoming)
 {
+    // 1. Absent: this store has never held the uid, as a task or as a tombstone.
     if (!local.present && !local.tombstoned)
     {
-        // A tombstone for a task we never had is a no-op, not an insert: there
-        // is nothing to remove, and recording one would grow the tombstone
-        // count on machines that never held the task.
-        return incoming.deleted ? SyncAction::kSkip : SyncAction::kInsert;
+        // A tombstone for a uid we have never held is ADOPTED, not skipped.
+        // The chain from "skip" to "the deleted task is back everywhere" is
+        // short, and every step of it is invisible from this machine:
+        //
+        //   1. A machine that skips the tombstone records nothing.
+        //   2. exportJsonl writes only what the store holds, so this machine's
+        //      export carries NO line for the uid.
+        //   3. A file with no line for a uid cannot be told from a file where
+        //      the task was never deleted — and git propagates the omission as a
+        //      deletion of the tombstone line.
+        //   4. Every machine still holding the task live (it has not synced
+        //      since the delete) learns nothing about the uid, keeps the task,
+        //      and republishes it live.
+        //
+        // The deletion is undone on every machine, and the machine that caused
+        // it reports "skipped: 1, clean". Absence from one side is never
+        // evidence of deletion (the header's tombstone rule), so the one machine
+        // that WAS told about it must carry the evidence onward.
+        return incoming.deleted ? SyncAction::kRecordTombstone : SyncAction::kInsert;
     }
 
+    // 2. Locally tombstoned, nothing live.
     if (!local.present)
     {
-        // Local state: tombstoned, nothing else.
         if (incoming.deleted)
         {
-            // Already gone; a second tombstone has nothing left to do.
-            return SyncAction::kSkip;
+            // Tombstone against tombstone: last write wins on the stamp, and
+            // only a STRICTLY newer one has anything to write.
+            //
+            // Adopting the stamp is what lets two machines converge here. A
+            // tombstone's stamp is otherwise written once and never revised —
+            // deleting a LIVE row is the only thing that writes one, and a
+            // second delete of the same uid is kNotFound — so two machines that
+            // each deleted the task locally, in their own second, would keep
+            // different stamps forever: their exports would differ on that line
+            // permanently and git would conflict on it at every sync.
+            return (incoming.stamp > local.stamp) ? SyncAction::kReviseTombstone
+                                                  : SyncAction::kSkip;
         }
 
-        // ASYMMETRY 2 of 2 — a post-delete edit resurrects (see the header), and
-        // only a STRICTLY newer one. A tie leaves our deletion standing, which
-        // mirrors the other asymmetry below: between "an edit made in the same
-        // second is lost" and "something the user deleted comes back", the
-        // version that loses the edit is the one that looks intentional.
+        // ASYMMETRY 2 — a post-delete edit resurrects (see the header), and only
+        // a STRICTLY newer one. A tie leaves our deletion standing, which
+        // mirrors asymmetry 1 below: between "an edit made in the same second is
+        // lost" and "something the user deleted comes back", the version that
+        // loses the edit is the one that looks intentional.
         return (incoming.stamp > local.stamp) ? SyncAction::kResurrect : SyncAction::kSkip;
     }
 
+    // 3. A live row locally, and a tombstone arriving. ASYMMETRY 1 — `>=`, where
+    //    every other comparison here is a strict `>`. A delete beats an edit
+    //    made in the same second: an edit lost this way can be retyped, whereas
+    //    a task that reappears after the user deleted it reads as the tool
+    //    ignoring an instruction.
     if (incoming.deleted)
     {
-        // ASYMMETRY 1 of 2 — `>=`, where every other comparison here is a
-        // strict `>`. A delete beats an edit made in the same second. See the
-        // header: an edit lost this way can be retyped, whereas a task that
-        // reappears after the user deleted it reads as the tool ignoring an
-        // instruction.
         return (incoming.stamp >= local.stamp) ? SyncAction::kDelete : SyncAction::kSkip;
     }
 
-    // Both sides live: the incoming record wins only if it is strictly newer.
-    // Equal stamps mean the two machines agree on the last write, so re-applying
-    // our own copy would be churn — and every merge would report churn as a
-    // change, which is what MergeReport::clean() exists to avoid.
-    return (incoming.stamp > local.stamp) ? SyncAction::kUpdate : SyncAction::kSkip;
+    // 4. Both sides live: the incoming record wins only if it is STRICTLY newer.
+    if (incoming.stamp > local.stamp)
+    {
+        return SyncAction::kUpdate;
+    }
+
+    if (incoming.stamp < local.stamp)
+    {
+        return SyncAction::kSkip;
+    }
+
+    // ASYMMETRY 3. Equal stamps, so the timestamps carry no ordering — but
+    // "equal stamp" is NOT "equal content": two machines can each edit the same
+    // task inside the same second, and nothing ever raises a stamp on its own.
+    // Skipping here would leave each machine holding its own copy forever while
+    // the merge reported "skipped: 1, clean".
+    //
+    // So the CONTENT decides, by the LARGER digest. Both machines see the same
+    // two records and compute the same two digests with the same function, so
+    // the record with the larger digest wins on both of them — no clock, no
+    // tie-break server, no third round trip. The loser's edit is discarded,
+    // which is unavoidable: with no ordering information left something must
+    // lose, and losing deterministically on both sides is the only outcome that
+    // converges instead of oscillating.
+    //
+    // A caller that handed over no local row cannot answer the content question
+    // (an empty uid in LocalState::task; see its comment). Skipping is the
+    // conservative answer: it preserves today's behaviour, whereas treating
+    // "unknown content" as "different" would make each machine adopt the
+    // other's equal-stamp record on every merge — the two would swap copies
+    // forever and no merge would ever come out clean.
+    if (local.task.uid.empty())
+    {
+        return SyncAction::kSkip;
+    }
+
+    const std::string ours = contentDigest(local.task);
+    const std::string theirs = contentDigest(incoming.task);
+
+    // Digests are fixed-width lowercase hex, so this string comparison is the
+    // same order as comparing the underlying 64-bit values: the tie-break does
+    // not depend on how a reader chooses to think about the digest.
+    return (theirs > ours) ? SyncAction::kUpdate : SyncAction::kSkip;
 }
 
 } // namespace taskpilot

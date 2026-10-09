@@ -110,6 +110,14 @@ struct MergeReport
     std::size_t resurrected{ 0 }; ///< Tombstoned uids brought back by a newer edit.
     std::size_t skipped{ 0 };     ///< Records the local copy already won.
 
+    /// Records whose stamp arrived outside the plausible window and was clamped
+    /// into it (TaskSync::clampPlausibleStamp). Counted separately from the
+    /// actions because it describes the INPUT, not the decision: a caller seeing
+    /// this non-zero has a peer or a client sending timestamps in the wrong unit
+    /// — a bug worth fixing at its source, and one that used to be invisible
+    /// because the value was accepted verbatim.
+    std::size_t stamps_adjusted{ 0 };
+
     std::vector<std::string> inserted_titles;
     std::vector<std::string> updated_titles;
     std::vector<std::string> deleted_titles;

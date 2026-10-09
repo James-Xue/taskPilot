@@ -17,6 +17,8 @@
 //   4. JSON-RPC `error` reply          covered end to end by
 //                                    tests/integration/test_daemon_roundtrip.cpp
 //   5. malformed reply                 kJunkReply    kInternal + an excerpt
+//   6. reply over the byte cap         kBigReply     kInternal + the bound named
+//                                    (and, at a raised cap, every byte of it)
 //
 // These are unit tests in the sense that matters: no daemon, no store, no temp
 // files. The only peer is a scripted listener inside this process, on the
@@ -56,8 +58,10 @@
 #include <asio/read_until.hpp>
 #include <asio/write.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <future>
@@ -117,6 +121,58 @@ constexpr std::chrono::milliseconds kPollInterval{ 2 };
 /// added at the socket, so this same text is also what the excerpt assertions
 /// look for inside the error message.
 constexpr const char *kJunkReplyLine{ "not json at all" };
+
+/// Markers at the two ENDS of the kBigReply payload.
+///
+/// The markers are what make "the whole reply arrived" checkable. A length
+/// alone cannot tell a reply that lost its head from one that lost its tail,
+/// nor either from one that never carried the payload at all; two markers, one
+/// at each end, separate those cases from each other.
+constexpr const char *kBigReplyBegin{ "BEGIN-OF-BIG-REPLY" };
+constexpr const char *kBigReplyEnd{ "END-OF-BIG-REPLY" };
+
+/// The default reply cap, written out as a literal rather than read from
+/// kDefaultMaxReplyBytes.
+///
+/// Pinned on purpose, and the case that uses it is the reason: one of these
+/// exists to catch a SILENT move of the default, and a test that took its
+/// expected number from the same constant the client reads would follow such a
+/// move instead of failing it. Editing this literal is the deliberate act that
+/// says "the default really changed", and it has to be made together with the
+/// header.
+constexpr std::size_t kPinnedDefaultCapBytes{ 1024 * 1024 };
+
+/// Filler bytes between the markers in the kBigReply payload: more than the
+/// DEFAULT cap, so that a client built with that cap must refuse the reply and
+/// one built with a raised cap must return every byte of it. Derived from the
+/// pinned number, not from the header, for the reason above.
+constexpr std::size_t kBigReplyFillerBytes{ kPinnedDefaultCapBytes + 512 * 1024 };
+
+/// Filler for the case that checks the CONFIGURED bound, which is small: a cap
+/// is a cap at any size, and 64 KiB overruns it without writing megabytes to
+/// prove a point.
+constexpr std::size_t kSmallBoundFillerBytes{ 64 * 1024 };
+
+/// The cap the raised-cap case configures: twice the reply's payload, so the
+/// cap cannot be the thing that truncates anything, and comfortably above the
+/// default, so it is a ceiling that case really had to ask for.
+constexpr std::size_t kRaisedReplyBytes{ 2 * kBigReplyFillerBytes };
+
+/// The cap the configured-bound case configures. Deliberately not derived from
+/// the default, so a message that named the default instead of the configured
+/// value cannot pass.
+constexpr std::size_t kTightReplyBytes{ 4 * 1024 };
+
+/// Timeout for the case that must transfer the whole big reply. Comfortably
+/// longer than kShortTimeoutMs and still well under kCallDeadline, because that
+/// case is about the cap rather than about speed and a megabyte and a half is
+/// real work for a loaded machine.
+constexpr std::int64_t kBigReplyTimeoutMs{ 2000 };
+
+/// Chunk size for the fixture's big writes. Small enough that a client which
+/// gives up mid-line is noticed at the next chunk rather than after the whole
+/// reply has been handed to the kernel in one call.
+constexpr std::size_t kWriteChunkBytes{ 16 * 1024 };
 
 // ---------------------------------------------------------------------------
 // Support
@@ -198,6 +254,41 @@ template <typename Fn>
         kCallDeadline);
 }
 
+/// One `call()` against `port` on a client built the way every pre-cap caller
+/// built one: ControlClient(host, port), with BOTH defaults untouched. It exists
+/// so the claim "the defaults did not move" is asserted through the old two-
+/// argument form — the one the export subcommand itself used — rather than
+/// through the three-argument form that merely omits the new parameter.
+[[nodiscard]] std::optional<RpcResult> callWithBothDefaults(std::uint16_t port,
+                                                            const std::string &method)
+{
+    return runWithDeadline(
+        [port, method]() -> RpcResult
+        {
+            const ControlClient client(kLoopback, port);
+            return client.call(method, nlohmann::json::object());
+        },
+        kCallDeadline);
+}
+
+/// One `call()` against `port` with an explicit reply cap, bounded by
+/// kCallDeadline. Same ownership rule as callWithDeadline: the client is
+/// constructed inside the worker so that an overrun cannot reach a torn-down
+/// stack frame.
+[[nodiscard]] std::optional<RpcResult> callWithCap(std::uint16_t port,
+                                                   std::int64_t timeout_ms,
+                                                   std::size_t max_reply_bytes,
+                                                   const std::string &method)
+{
+    return runWithDeadline(
+        [port, timeout_ms, max_reply_bytes, method]() -> RpcResult
+        {
+            const ControlClient client(kLoopback, port, timeout_ms, max_reply_bytes);
+            return client.call(method, nlohmann::json::object());
+        },
+        kCallDeadline);
+}
+
 /// One `ping()` against `port`, bounded by kCallDeadline. Same ownership rule
 /// as callWithDeadline.
 [[nodiscard]] std::optional<bool> pingWithDeadline(std::uint16_t port, std::int64_t timeout_ms)
@@ -260,6 +351,63 @@ void expectErrorMessage(const RpcResult &result, ErrorCode expected,
     return port;
 }
 
+/// The exact payload FakeServer::Script::kBigReply puts in its reply: filler
+/// between the two markers, which is also what the case that reads it asserts
+/// against.
+[[nodiscard]] std::string bigReplyPayload(std::size_t filler_bytes)
+{
+    std::string payload(kBigReplyBegin);
+    payload.append(filler_bytes, 'x');
+    payload.append(kBigReplyEnd);
+    return payload;
+}
+
+/// One well-formed JSON-RPC reply carrying that payload under "blob", and its
+/// newline. Built with the JSON library rather than by hand so that the only
+/// thing that can be wrong with it is its size — the case under test must fail
+/// on the cap and not on a hand-escaped brace.
+[[nodiscard]] std::string bigReplyLine(std::size_t filler_bytes)
+{
+    const nlohmann::json reply{
+        { "jsonrpc", "2.0" },
+        { "id", 1 },
+        { "result", { { "blob", bigReplyPayload(filler_bytes) } } },
+    };
+    return reply.dump() + "\n";
+}
+
+/// Write `text` to `peer` in bounded chunks, stopping at the first error.
+///
+/// A client whose cap is smaller than the reply closes the connection while
+/// this is still writing, so a failed send is an expected END to the case under
+/// test rather than a fault in the fixture: the client has already received
+/// what it came for — an error naming its cap — and the loop stops there
+/// instead of reporting a peer that did exactly what it should.
+///
+/// Chunked rather than one asio::write because noticing that the peer has gone
+/// away is the whole point: a single call hands the entire reply to the kernel,
+/// where there is nothing left to stop at and nothing to learn.
+void writeUntilTheClientGivesUp(asio::ip::tcp::socket &peer, const std::string &text)
+{
+    std::size_t sent_total = 0;
+    while (sent_total < text.size())
+    {
+        const std::size_t chunk =
+            std::min<std::size_t>(kWriteChunkBytes, text.size() - sent_total);
+        std::error_code write_ec;
+        const std::size_t sent =
+            peer.write_some(asio::buffer(text.data() + sent_total, chunk), write_ec);
+        sent_total += sent;
+        if (write_ec || 0 == sent)
+        {
+            // A failed send, or (defensively — a blocking socket should not
+            // produce it) one that wrote nothing without failing, means there
+            // is no peer left to write to.
+            return;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FakeServer — the peer the client's failure modes are defined against
 // ---------------------------------------------------------------------------
@@ -286,12 +434,22 @@ class FakeServer
         kStall,     ///< Hold the socket open, write nothing: cause of mode 2.
         kClose,     ///< Close at once without replying: cause of mode 3.
         kJunkReply, ///< Read the request line, answer non-JSON: cause of mode 5.
+        /// Read the request line, then answer with one valid reply whose payload
+        /// is a megabyte and a half: cause of mode 6, and the only reply here
+        /// that a caller has to ask for a bigger cap to read whole.
+        kBigReply,
     };
 
-    explicit FakeServer(Script script)
+    /// `reply_filler_bytes` is the payload size for kBigReply and is ignored by
+    /// the other scripts, which write fixed bytes. It is a constructor
+    /// parameter rather than a constant inside the script so that one case can
+    /// overrun a SMALL configured cap with a modest reply while the others use
+    /// the large one.
+    explicit FakeServer(Script script, std::size_t reply_filler_bytes = kBigReplyFillerBytes)
         : m_io(),
           m_acceptor(m_io),
-          m_script(script)
+          m_script(script),
+          m_replyFillerBytes(reply_filler_bytes)
     {
         const asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v4(), kAnyFreePort);
 
@@ -392,6 +550,12 @@ class FakeServer
         //   3. kJunkReply — wait for the request line (a real daemon reads
         //                   before it writes), then answer with bytes that are
         //                   not JSON.
+        //   4. kBigReply  — wait for the request line, then answer with a valid
+        //                   reply large enough to overrun the client's default
+        //                   cap. Whether the whole line lands depends on the
+        //                   cap the client was given, and a client that refuses
+        //                   it closes mid-write; that is the case passing, not
+        //                   the fixture failing.
         switch (m_script)
         {
             case Script::kStall:
@@ -411,6 +575,15 @@ class FakeServer
                 {
                     const std::string reply = std::string(kJunkReplyLine) + "\n";
                     asio::write(peer, asio::buffer(reply), write_ec);
+                }
+                break;
+            }
+            case Script::kBigReply:
+            {
+                std::string request;
+                if (readRequestLine(peer, request))
+                {
+                    writeUntilTheClientGivesUp(peer, bigReplyLine(m_replyFillerBytes));
                 }
                 break;
             }
@@ -445,23 +618,34 @@ class FakeServer
         // is part of the line, and read_until searches what the buffer already
         // holds before asking the socket for more.
         line.clear();
+        bool complete = false;
         while (!isStopping())
         {
             ec.clear();
             asio::read_until(peer, asio::dynamic_buffer(line), '\n', ec);
             if (!ec)
             {
-                return true;
+                complete = true;
+                break;
             }
             if (asio::error::would_block != ec && asio::error::try_again != ec)
             {
                 // EOF or a reset: the peer is gone, so there is no line to read.
-                return false;
+                break;
             }
             std::this_thread::sleep_for(kPollInterval);
         }
 
-        return false;
+        // Blocking mode is restored before returning, because the caller writes
+        // its script on this same socket next and a synchronous asio write
+        // gives up at the first would_block instead of finishing the line.
+        // Harmless for the short replies, which fit in the send buffer whole,
+        // and wrong for kBigReply, which cannot: there it would leave the
+        // client a truncated line and turn a case about the cap into a case
+        // about a fixture that never sent a newline.
+        std::error_code restore_ec;
+        std::ignore = peer.non_blocking(false, restore_ec);
+        return complete;
     }
 
     /// Block the script until stop() is called. Only used by kStall, which
@@ -500,6 +684,7 @@ class FakeServer
     asio::io_context m_io;
     asio::ip::tcp::acceptor m_acceptor;
     Script m_script;
+    std::size_t m_replyFillerBytes{ kBigReplyFillerBytes };
     std::uint16_t m_port{ kAnyFreePort };
     std::thread m_thread;
     std::mutex m_mutex;
@@ -601,6 +786,83 @@ TEST(ControlClient, AMalformedReplyIsReportedWithAnExcerpt)
     // this" is, which is why the header promises the excerpt — so the excerpt
     // is what the assertion is about, not just the error code.
     expectErrorMessage(*result, ErrorCode::kInternal, { "not JSON", kJunkReplyLine });
+}
+
+// ---------------------------------------------------------------------------
+// Mode 6: a reply over the byte cap. Three cases, because the cap became a
+// caller's choice and all three halves of that matter: the default stayed where
+// it was, a raised cap really does read the whole reply, and the bound in the
+// error is the one this client was given rather than a constant.
+//
+// This is the export path's failure mode: export_tasks answers with the whole
+// backlog, so its reply grows with the backlog and a fixed cap would have made
+// the call fail permanently once it was reached — with no way to page a
+// document that has to arrive as one line.
+// ---------------------------------------------------------------------------
+TEST(ControlClient, TheDefaultCapStillRefusesAReplyOverAMegabyte)
+{
+    FakeServer server(FakeServer::Script::kBigReply, kBigReplyFillerBytes);
+
+    // Constructed with NO cap argument — the two-argument form the export
+    // subcommand itself used before the cap was a parameter. Making the cap a
+    // parameter is only safe if the default did not move with it: were it
+    // raised globally, a peer that answers with a runaway line could cost every
+    // caller of every method that memory.
+    const std::optional<RpcResult> result =
+        callWithBothDefaults(server.port(), "export_tasks");
+
+    ASSERT_TRUE(result.has_value())
+        << "call() had not returned " << kCallDeadline.count()
+        << " ms after a reply larger than the default cap was written back";
+    ASSERT_FALSE(result->ok()) << "a reply over the default cap must not be accepted";
+    expectErrorMessage(*result, ErrorCode::kInternal,
+                       { "exceeded", std::to_string(kPinnedDefaultCapBytes) + " bytes" });
+}
+
+TEST(ControlClient, ARaisedCapReturnsEveryByteOfAReplyOverAMegabyte)
+{
+    FakeServer server(FakeServer::Script::kBigReply, kBigReplyFillerBytes);
+
+    const std::optional<RpcResult> result =
+        callWithCap(server.port(), kBigReplyTimeoutMs, kRaisedReplyBytes, "export_tasks");
+
+    ASSERT_TRUE(result.has_value())
+        << "call() had not returned " << kCallDeadline.count()
+        << " ms after a reply larger than a megabyte was written back";
+    ASSERT_TRUE(result->ok()) << "a reply below the configured cap must be read whole: "
+                              << describe(result->error());
+
+    // Content, not merely "no error": a client that stopped at the old cap and
+    // returned what it had would pass an error-only assertion while handing the
+    // export a truncated line — which is worse than failing, because that file
+    // is what the user commits. Both ends are checked because a truncation can
+    // be either, and the length because a reply that lost its middle satisfies
+    // both markers.
+    const std::string blob = result->value().at("blob").get<std::string>();
+    const std::size_t expected_size = kBigReplyFillerBytes +
+                                      std::string(kBigReplyBegin).size() +
+                                      std::string(kBigReplyEnd).size();
+    EXPECT_EQ(expected_size, blob.size()) << "the reply did not arrive intact";
+    EXPECT_TRUE(blob.starts_with(kBigReplyBegin)) << "the head of the reply was lost";
+    EXPECT_TRUE(blob.ends_with(kBigReplyEnd)) << "the tail of the reply was lost";
+}
+
+TEST(ControlClient, AReplyOverTheConfiguredCapIsAnErrorNamingThatCap)
+{
+    FakeServer server(FakeServer::Script::kBigReply, kSmallBoundFillerBytes);
+
+    const std::optional<RpcResult> result =
+        callWithCap(server.port(), kShortTimeoutMs, kTightReplyBytes, "export_tasks");
+
+    ASSERT_TRUE(result.has_value())
+        << "call() had not returned " << kCallDeadline.count()
+        << " ms after a reply over a small configured cap was written back";
+    ASSERT_FALSE(result->ok()) << "a reply over the configured cap must fail, whatever the cap is";
+    // The BOUND it was given, not a constant: this message is what a caller
+    // reads to learn how far it has to raise the ceiling, so it has to name the
+    // number this client actually had.
+    expectErrorMessage(*result, ErrorCode::kInternal,
+                       { "exceeded", std::to_string(kTightReplyBytes) + " bytes" });
 }
 
 // ---------------------------------------------------------------------------

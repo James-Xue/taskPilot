@@ -1,4 +1,4 @@
-// Uuid.cpp — version-4 uuid generation and the shape check
+// Uuid.cpp — version-4 uuid generation, text-derived uuids, and the shape check
 //
 // Entropy comes from /dev/urandom and from nowhere else. <random>'s
 // std::random_device is permitted to be deterministic, and a deterministic
@@ -10,17 +10,29 @@
 // exactly what Uuid.hpp means by "a uuid that silently repeats is worse than a
 // loud failure".
 //
-// The check is a pure function of the text it is handed: no database, no
-// clock, no I/O. TaskSync's parser runs it against every line of a file that
-// may have been hand-edited, truncated by a bad checkout, or written by an
-// older version, and answering "is this even the right SHAPE of identifier"
-// must not depend on anything the caller happens to have loaded.
+// deriveUuidFromText() is the mirror image of that rule rather than a
+// contradiction of it. Backfilling a uid onto a row that predates the column is
+// the one situation where randomness is the failure mode: two machines holding
+// the same restored backup must derive the SAME uid for the same row, or the
+// first sync sees two unknown uids and inserts every task twice. So that path
+// is fixed arithmetic over the row's content — an identity, not a secret, and
+// safe only where identity is the requirement.
+//
+// The check accepts exactly ONE spelling of the text form, lowercase, for the
+// same reason the derivation is deterministic: every merge comparison keys on
+// the uid string, so a second spelling is a second identity. It is otherwise a
+// pure function of the text it is handed: no database, no clock, no I/O.
+// TaskSync's parser runs it against every line of a file that may have been
+// hand-edited, truncated by a bad checkout, or written by an older version, and
+// answering "is this even the right SHAPE of identifier" must not depend on
+// anything the caller happens to have loaded.
 
 #include "core/Uuid.hpp"
 
 #include <array>
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <fcntl.h>
 #include <string>
@@ -34,6 +46,12 @@ namespace
 /// A uuid is 128 bits, so the generator reads exactly this many bytes. Reading
 /// fewer would leave a fixed tail in every uuid this process ever produces.
 constexpr std::size_t kUuidBytes{ 16 };
+
+/// Half of a uuid, and therefore the number of bytes each of the two 64-bit
+/// digest passes in deriveUuidFromText() contributes. Named so the layout
+/// arithmetic below reads as "first half, second half" rather than as the
+/// literal 8.
+constexpr std::size_t kHalfBytes{ kUuidBytes / 2 };
 
 /// 32 hex digits plus 4 hyphens. Also the length every valid text form has,
 /// which makes it the check's first and cheapest rejection.
@@ -73,26 +91,30 @@ char hexDigit(unsigned int value)
     return kHexDigits[value & 0x0FU];
 }
 
-/// True for a hex digit in either case.
+/// True for a LOWERCASE hex digit: 0-9 or a-f, and nothing else.
 ///
-/// Uppercase is accepted, and the reason is the variant nibble: the four
-/// characters that satisfy RFC 4122's "variant is 10xx" marker are 8, 9, a and
-/// b, and A/B are the very same nibbles. A reader that took one spelling and
-/// refused the other would have to special-case a single position, which is a
-/// far stranger rule than "hex is case-insensitive". Nothing taskPilot writes
-/// is uppercase (see kHexDigits), so the tolerance only ever applies to a line
-/// that arrived from outside.
+/// The restriction is a correctness rule, not a preference, and its cost runs
+/// in one direction only:
+///   1. Every merge comparison keys on the uid STRING — the tasks.uid column,
+///      its unique index, and the lookup in mergeJsonl.
+///   2. So "9F3C…" and "9f3c…" are not two spellings of one identity, they are
+///      two identities. Accepting both lets one task carry both, and it then
+///      duplicates on every machine while the shared export file holds both
+///      spellings forever.
+///   3. Nothing inside taskPilot writes uppercase (see kHexDigits) and nothing
+///      anywhere normalises case, so there is no legitimate producer the lenient
+///      form could be serving — only a second way to name a row.
+///
+/// What that costs, stated plainly: a hand-edited line that capitalised a digit
+/// is refused outright instead of merged. That is the intended trade — a loud
+/// refusal is recoverable, a silent duplicate is not.
 [[nodiscard]] bool isHexDigit(char character)
 {
     if ('0' <= character && '9' >= character)
     {
         return true;
     }
-    if ('a' <= character && 'f' >= character)
-    {
-        return true;
-    }
-    return 'A' <= character && 'F' >= character;
+    return 'a' <= character && 'f' >= character;
 }
 
 /// True at the four text offsets where the canonical form carries a hyphen.
@@ -108,13 +130,110 @@ char hexDigit(unsigned int value)
     return false;
 }
 
-/// The variant nibble: 8, 9, a or b, in either case. The other twelve values
-/// describe uuids from schemes this project does not speak, so a line carrying
-/// one is rejected rather than merged under a shape we would misread.
+/// The variant nibble: 8, 9, a or b — lowercase, like every other hex digit the
+/// text form may carry.
+///
+/// A and B were accepted until this rule was tightened, and they are precisely
+/// the case the header's reasoning is about: they name the same nibbles as a
+/// and b, so a checker that took them would give one uuid two spellings and
+/// therefore two identities. They are refused for exactly the reason the body's
+/// hex digits are.
+///
+/// The other twelve values are a different question entirely — they select uuid
+/// schemes this project does not speak — so a line carrying one is rejected
+/// rather than merged under a shape we would misread.
 [[nodiscard]] bool isVariantNibble(char character)
 {
-    return '8' == character || '9' == character || 'a' == character || 'b' == character
-        || 'A' == character || 'B' == character;
+    return '8' == character || '9' == character || 'a' == character || 'b' == character;
+}
+
+/// Return `bytes` with the version and the variant nibbles stamped onto them.
+///
+/// Both fields are written OVER bits of the input rather than beside it, so the
+/// result stays 128 bits wide: a v4 uuid has 122 unconstrained bits and 6 fixed
+/// ones. Taking the array by value is deliberate — the caller's buffer is left
+/// untouched, so no caller can be surprised by a stamp it did not ask for, and
+/// the compiler may forward the copy instead of materialising it.
+///
+/// Shared by generateUuidV4 and deriveUuidFromText so a uuid-shaped value is
+/// stamped the same way whichever source produced it, and therefore answers to
+/// the same reader in looksLikeUuidV4.
+[[nodiscard]] std::array<unsigned char, kUuidBytes> stampedVersionAndVariant(
+    std::array<unsigned char, kUuidBytes> bytes)
+{
+    bytes[kVersionByteIndex] =
+        static_cast<unsigned char>((bytes[kVersionByteIndex] & 0x0FU) | 0x40U);
+    bytes[kVariantByteIndex] =
+        static_cast<unsigned char>((bytes[kVariantByteIndex] & 0x3FU) | 0x80U);
+    return bytes;
+}
+
+/// Render sixteen bytes as the 8-4-4-4-12 lowercase hex text form.
+///
+/// The hyphens are inserted by BYTE boundary (before bytes 4, 6, 8 and 10)
+/// rather than by counting output characters, so a change to the group widths
+/// cannot silently produce a shape that looksLikeUuidV4 would then reject. The
+/// layout lives here and nowhere else for the same reason: the generator and
+/// the derivation cannot drift into two spellings of one identifier.
+[[nodiscard]] std::string renderUuidText(const std::array<unsigned char, kUuidBytes> &bytes)
+{
+    std::string text;
+    text.reserve(kUuidTextLength);
+    for (std::size_t index = 0; index < kUuidBytes; ++index)
+    {
+        if (4 == index || 6 == index || 8 == index || 10 == index)
+        {
+            text.push_back('-');
+        }
+        text.push_back(hexDigit(static_cast<unsigned int>(bytes[index] >> 4)));
+        text.push_back(hexDigit(static_cast<unsigned int>(bytes[index] & 0x0FU)));
+    }
+    return text;
+}
+
+/// The two constant pairs the derived uuid's 128 bits are computed with.
+///
+/// Two passes rather than one because a single 64-bit digest would make the
+/// derived identity 64 bits wide, while the header's collision argument ("two
+/// rows collide only if their canonical forms are identical") rests on 128. The
+/// two pairs must share NO constant: two passes over the same text with the
+/// same multiplier stay related by a factor that depends only on the text's
+/// length, so the second 64 bits could be computed from the first and the value
+/// would carry 64 bits of content however it is rendered.
+///
+/// The first pair is FNV-1a's own 64-bit offset basis and prime. The second is
+/// two odd constants from unrelated 64-bit mixing designs (xxHash's primary
+/// multiplier, and splitmix64's golden gamma). Oddness is the property that
+/// matters: multiplying by an odd number is invertible modulo 2^64, which is
+/// what keeps the multiply a mixing step rather than a value-destroying one.
+constexpr std::uint64_t kFirstOffsetBasis{ 14695981039346656037ULL };
+constexpr std::uint64_t kFirstPrime{ 1099511628211ULL };
+constexpr std::uint64_t kSecondOffsetBasis{ 11400714785074694791ULL };
+constexpr std::uint64_t kSecondPrime{ 11400714819323198485ULL };
+
+/// One FNV-1a pass: start from `offsetBasis`, then for each byte XOR it into the
+/// state and multiply by `prime`.
+///
+/// Basis and prime are parameters rather than constants because the derivation
+/// runs this same arithmetic twice with two unrelated pairs; see the constants
+/// above for why the pairs must not be shared.
+[[nodiscard]] std::uint64_t fnv1a64(const std::string &text, std::uint64_t offsetBasis,
+                                    std::uint64_t prime)
+{
+    std::uint64_t digest = offsetBasis;
+    for (const char character : text)
+    {
+        // The byte enters the state as an UNSIGNED octet. A plain char may be
+        // signed, and a byte above 0x7f would then arrive as a negative int and
+        // sign-extend into the state — which would make the derived uid depend
+        // on the platform's char signedness. Two machines disagreeing about the
+        // uid of one row is the exact duplication this function exists to
+        // prevent, so the widening is written out rather than left to the
+        // compiler.
+        digest ^= static_cast<std::uint64_t>(static_cast<unsigned char>(character));
+        digest *= prime;
+    }
+    return digest;
 }
 
 /// Read exactly kUuidBytes bytes from the kernel entropy pool.
@@ -192,34 +311,11 @@ Result<std::string> generateUuidV4()
         return entropy.error();
     }
 
-    // 2. Stamp the version and the variant. Both fields are written over bits
-    //    of the random data rather than beside them, so the uuid stays 128 bits
-    //    wide — a v4 uuid has 122 random bits and 6 fixed ones. The copy is
-    //    taken before the first write so the buffer this function hands on is
-    //    the only one that has been modified.
-    std::array<unsigned char, kUuidBytes> stamped = entropy.value();
-    stamped[kVersionByteIndex] =
-        static_cast<unsigned char>((stamped[kVersionByteIndex] & 0x0FU) | 0x40U);
-    stamped[kVariantByteIndex] =
-        static_cast<unsigned char>((stamped[kVariantByteIndex] & 0x3FU) | 0x80U);
-
-    // 3. Render as 8-4-4-4-12 lowercase hex. The hyphens are inserted by BYTE
-    //    boundary (before bytes 4, 6, 8 and 10) rather than by counting output
-    //    characters, so a change to the group widths cannot silently produce a
-    //    shape that looksLikeUuidV4 would then reject.
-    std::string text;
-    text.reserve(kUuidTextLength);
-    for (std::size_t index = 0; index < kUuidBytes; ++index)
-    {
-        if (4 == index || 6 == index || 8 == index || 10 == index)
-        {
-            text.push_back('-');
-        }
-        text.push_back(hexDigit(static_cast<unsigned int>(stamped[index] >> 4)));
-        text.push_back(hexDigit(static_cast<unsigned int>(stamped[index] & 0x0FU)));
-    }
-
-    return text;
+    // 2. Stamp the version and the variant, then render. Both steps are shared
+    //    with deriveUuidFromText, so a uuid-shaped value produced by either
+    //    function is laid out by the same code and read back by the same rules;
+    //    the generator differs only in where its 128 bits come from.
+    return renderUuidText(stampedVersionAndVariant(entropy.value()));
 }
 
 bool looksLikeUuidV4(const std::string &text)
@@ -262,6 +358,44 @@ bool looksLikeUuidV4(const std::string &text)
         return false;
     }
     return isVariantNibble(text[kVariantCharacterIndex]);
+}
+
+std::string deriveUuidFromText(const std::string &canonical)
+{
+    // A derived uuid is an IDENTITY, never a SECRET. It is arithmetic over the
+    // row's own content, so anyone who holds that canonical text can reproduce
+    // this value, and the derivation is deterministic by contract so that two
+    // machines restoring one backup agree on it (Uuid.hpp). Where
+    // unpredictability matters — a token, a capability, a nonce — this function
+    // is the wrong tool and generateUuidV4() is the right one.
+    //
+    // 1. Two 64-bit passes over the canonical text, concatenated into the 128
+    //    bits a uuid has. The two constant pairs share no constant, so the
+    //    second half is not computable from the first (see the constants).
+    const std::uint64_t first = fnv1a64(canonical, kFirstOffsetBasis, kFirstPrime);
+    const std::uint64_t second = fnv1a64(canonical, kSecondOffsetBasis, kSecondPrime);
+
+    // 2. Lay the passes out big-endian, byte by byte, rather than reinterpreting
+    //    the integers' bytes. A memcpy would make the result depend on the
+    //    host's byte order, and a big-endian machine would then derive a
+    //    different uid for the same row than a little-endian one — the sync
+    //    would insert the row on both machines and never converge.
+    std::array<unsigned char, kUuidBytes> bytes{};
+    for (std::size_t index = 0; index < kHalfBytes; ++index)
+    {
+        const std::size_t shift = 8 * (kHalfBytes - 1 - index);
+        bytes[index] = static_cast<unsigned char>((first >> shift) & 0xFFU);
+        bytes[kHalfBytes + index] = static_cast<unsigned char>((second >> shift) & 0xFFU);
+    }
+
+    // 3. Stamp the version and the variant so the result is a v4 uuid by SHAPE,
+    //    which is what lets every reader in the system — the export parser, the
+    //    merge lookup, the store's uid column — stay single-path instead of
+    //    growing a second branch for derived identifiers. Six of the 128 derived
+    //    bits are spent on those two nibbles; the other 122 carry the digest.
+    //    Rendering then writes the one spelling this project spells, so a
+    //    derived uuid is indistinguishable from a generated one downstream.
+    return renderUuidText(stampedVersionAndVariant(bytes));
 }
 
 } // namespace taskpilot

@@ -1813,26 +1813,346 @@ TEST(TaskStoreTest, MergeResurrectsATaskEditedAfterItsDelete)
     EXPECT_TRUE(echo.clean());
 }
 
-TEST(TaskStoreTest, ATombstoneForAnUnknownUidChangesNothing)
+// This case replaces one that asserted a tombstone for an unknown uid changed
+// nothing — the behaviour TaskSync.hpp's kRecordTombstone comment now argues
+// against, because a machine that stores nothing republishes a file with no line
+// for that uid, and an absent line is indistinguishable from "never deleted".
+// The chain below is deliberately the whole story: create, delete, hop to a
+// machine that never held the uid, and read that machine's OWN export.
+TEST(TaskStoreTest, ATombstoneForAnUnknownUidIsRecordedAndTravels)
 {
-    const std::unique_ptr<TaskStore> store = openStore(":memory:");
-    ASSERT_NE(nullptr, store);
-    const Task kept = okValue(store->addTask(draftTask("still here")), Task{}, "addTask");
+    const std::unique_ptr<TaskStore> a = openStore(":memory:");
+    const std::unique_ptr<TaskStore> c = openStore(":memory:");
+    ASSERT_NE(nullptr, a);
+    ASSERT_NE(nullptr, c);
 
-    const MergeReport report =
-        okValue(store->mergeJsonl(tombstoneRecord(newUid(), 1700000000) + "\n", false),
-                MergeReport{}, "mergeJsonl");
-    EXPECT_EQ(1U, report.skipped);
-    EXPECT_TRUE(report.clean());
+    // A creates a task and deletes it, so its export holds exactly one line: the
+    // tombstone. C has never held that uid — neither as a task nor as a
+    // tombstone — which is the one state where "I know nothing about it" and "I
+    // am adopting a deletion" can be confused. The confusion is not symmetric:
+    // adopting the line costs one row, skipping it destroys the only evidence
+    // the deletion ever happened.
+    const Task task = okValue(a->addTask(draftTask("deleted on A")), Task{}, "addTask");
+    expectOk(a->deleteTask(task.id), "deleteTask");
+    const std::string a_export = okValue(a->exportJsonl(), std::string{}, "exportJsonl");
+    ASSERT_EQ(0U, okValue(c->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
 
-    // A delete for a task this machine never had inserts nothing: no task
-    // appears, and no tombstone is stored for a uid that was never here —
-    // storing one would let a stray line in an old export claim this machine
-    // deliberately deleted something it never saw.
-    const std::vector<Task> tasks = tasksByUid(*store);
-    ASSERT_EQ(1U, tasks.size());
-    EXPECT_EQ(kept.uid, tasks.front().uid);
-    EXPECT_EQ(0U, okValue(store->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
+    const MergeReport adopted = okValue(c->mergeJsonl(a_export, false), MergeReport{}, "mergeJsonl");
+    EXPECT_EQ(1U, adopted.inserted) << "a tombstone for an unknown uid was not recorded";
+    EXPECT_EQ(0U, adopted.skipped) << "the deletion was skipped rather than stored";
+    EXPECT_FALSE(adopted.clean()) << "adopting a deletion is a change, not a no-op";
+
+    // Stored: the uid is present as a tombstone, and no task appeared for it.
+    EXPECT_EQ(1U, okValue(c->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
+    EXPECT_TRUE(tasksByUid(*c).empty()) << "a tombstone for an unknown uid created a task";
+
+    // ...and it SURVIVES into C's OWN export. This is the assertion the whole
+    // rule turns on. A machine that stores nothing republishes a file with no
+    // line for this uid; a file with no line is indistinguishable from one where
+    // the task was never deleted; git propagates the omission as a deletion of
+    // the tombstone; and every machine still holding the task live learns
+    // nothing, keeps it and republishes it — so the deleted task comes back
+    // everywhere, while the machine that dropped the line reported a clean
+    // merge of one skipped record.
+    const std::string c_export = okValue(c->exportJsonl(), std::string{}, "exportJsonl");
+    EXPECT_EQ(a_export, c_export) << "the record did not survive the hop";
+    const std::vector<std::string> lines = splitLines(c_export);
+    ASSERT_EQ(1U, lines.size());
+    const nlohmann::json record = nlohmann::json::parse(lines.front());
+    EXPECT_EQ(task.uid, record.at("uid").get<std::string>());
+    EXPECT_TRUE(record.at("deleted").get<bool>());
+
+    // The echo back is a no-op: one record per uid, so this is neither a second
+    // tombstone nor an insert (TaskSync.hpp, property 3).
+    const MergeReport echo = mergeFrom(*c, *a);
+    EXPECT_TRUE(echo.clean());
+    EXPECT_EQ(1U, echo.skipped);
+    EXPECT_EQ(1U, okValue(a->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
+}
+
+TEST(TaskStoreTest, TwoMachinesDeletingOneTaskConvergeOnTheNewerStamp)
+{
+    const std::unique_ptr<TaskStore> a = openStore(":memory:");
+    const std::unique_ptr<TaskStore> b = openStore(":memory:");
+    ASSERT_NE(nullptr, a);
+    ASSERT_NE(nullptr, b);
+
+    // One task, learned by both machines from the same record, so the two rows
+    // are identical and only the deletions below differ.
+    const std::string uid = newUid();
+    const std::int64_t created = 1700000000;
+    const std::string shared = liveRecord(uid, "delete on both", created, created);
+    ASSERT_EQ(1U, okValue(a->mergeJsonl(shared + "\n", false), MergeReport{}, "mergeJsonl").inserted);
+    ASSERT_EQ(1U, okValue(b->mergeJsonl(shared + "\n", false), MergeReport{}, "mergeJsonl").inserted);
+
+    // Each machine deletes it during its own second. A tombstone's stamp is only
+    // ever written by deleting a LIVE row — a second delete is kNotFound — so if
+    // no merge could revise a stamp, these two would stay different forever: the
+    // machines never converge and git conflicts on that line at every sync. The
+    // stamps are chosen because the test has to know which one is newer.
+    const std::int64_t older = created + 5;
+    const std::int64_t newer = created + 9;
+    ASSERT_EQ(1U, okValue(a->mergeJsonl(tombstoneRecord(uid, older) + "\n", false), MergeReport{},
+                          "mergeJsonl")
+                      .deleted);
+    ASSERT_EQ(1U, okValue(b->mergeJsonl(tombstoneRecord(uid, newer) + "\n", false), MergeReport{},
+                          "mergeJsonl")
+                      .deleted);
+
+    // A → B: B's stamp is the newer one, so B has nothing to learn and must not
+    // revoke its own.
+    const MergeReport into_b = mergeFrom(*a, *b);
+    EXPECT_EQ(1U, into_b.skipped);
+    EXPECT_EQ(0U, into_b.updated);
+
+    // B → A: strictly newer — the one action that revises a tombstone's stamp.
+    const MergeReport into_a = mergeFrom(*b, *a);
+    EXPECT_EQ(1U, into_a.updated);
+    EXPECT_EQ(0U, into_a.inserted);
+    EXPECT_EQ(0U, into_a.deleted);
+
+    // Both sides now describe the deletion with the SAME stamp, and their
+    // exports are byte-identical: that equality is the point, because two stamps
+    // would mean the two files differ on this line permanently.
+    const std::string a_export = okValue(a->exportJsonl(), std::string{}, "exportJsonl");
+    EXPECT_EQ(a_export, okValue(b->exportJsonl(), std::string{}, "exportJsonl"));
+    const std::vector<std::string> lines = splitLines(a_export);
+    ASSERT_EQ(1U, lines.size());
+    const nlohmann::json record = nlohmann::json::parse(lines.front());
+    EXPECT_TRUE(record.at("deleted").get<bool>());
+    EXPECT_EQ(newer, record.at("updated_at").get<std::int64_t>()) << "the older stamp won";
+
+    // Converged: a further pass in either direction revises nothing, so two
+    // machines cannot trade stamps back and forth.
+    EXPECT_TRUE(mergeFrom(*b, *a).clean());
+    EXPECT_TRUE(mergeFrom(*a, *b).clean());
+    EXPECT_EQ(1U, okValue(a->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
+    EXPECT_EQ(1U, okValue(b->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
+}
+
+TEST(TaskStoreTest, AnEqualStampDisagreementIsBrokenByContentNotBySide)
+{
+    const std::unique_ptr<TaskStore> a = openStore(":memory:");
+    const std::unique_ptr<TaskStore> b = openStore(":memory:");
+    ASSERT_NE(nullptr, a);
+    ASSERT_NE(nullptr, b);
+
+    // One task, one second, two different edits, so the stamps are EQUAL and the
+    // timestamps carry no ordering at all. Stamps are wall clock at one-second
+    // resolution, so this is reachable for any pair of machines rather than a
+    // contrived race.
+    const std::string uid = newUid();
+    const std::int64_t created = 1700000000;
+    const std::int64_t same_second = created + 60;
+    const std::string option_a = liveRecord(uid, "offsite: option A", created, same_second);
+    const std::string option_b = liveRecord(uid, "offsite: option B", created, same_second);
+    ASSERT_EQ(1U, okValue(a->mergeJsonl(option_a + "\n", false), MergeReport{}, "mergeJsonl").inserted);
+    ASSERT_EQ(1U, okValue(b->mergeJsonl(option_b + "\n", false), MergeReport{}, "mergeJsonl").inserted);
+
+    // Each machine merges the other's copy. Exactly ONE of the two directions may
+    // apply anything: if both did, each would adopt the other's record and the
+    // pair would trade copies forever; if neither did, the machines would stay
+    // forked on that uid with the merge reporting "skipped: 2, clean". Which
+    // direction wins is decided by CONTENT — and the store's half of that is
+    // handing decide() the local row (LocalState::task), without which both
+    // directions skip and the fork is permanent.
+    const MergeReport into_b = mergeFrom(*a, *b);
+    const MergeReport into_a = mergeFrom(*b, *a);
+    EXPECT_EQ(1U, into_b.updated + into_a.updated)
+        << "the tie-break must pick one winner, not an update in each direction";
+
+    // Both machines now hold the SAME record, decided by content alone and never
+    // by which side happens to be asking.
+    const std::string converged = okValue(a->exportJsonl(), std::string{}, "exportJsonl");
+    EXPECT_EQ(converged, okValue(b->exportJsonl(), std::string{}, "exportJsonl"))
+        << "the two machines converged on different records";
+    const std::vector<std::string> lines = splitLines(converged);
+    ASSERT_EQ(1U, lines.size());
+    const nlohmann::json record = nlohmann::json::parse(lines.front());
+    ASSERT_EQ(1, record.at("v").get<int>());
+    EXPECT_EQ(same_second, record.at("updated_at").get<std::int64_t>())
+        << "the tie-break moved the stamp instead of choosing a record";
+    const std::string winner = record.at("title").get<std::string>();
+    EXPECT_TRUE(winner == "offsite: option A" || winner == "offsite: option B")
+        << "neither record won: " << winner;
+
+    // And the pair is quiet afterwards: a further exchange applies nothing, so
+    // the winner is stable rather than something the machines keep re-deciding.
+    EXPECT_TRUE(mergeFrom(*a, *b).clean());
+    EXPECT_TRUE(mergeFrom(*b, *a).clean());
+}
+
+TEST(TaskStoreTest, ALocalEditNeverMovesARowsStampBackwards)
+{
+    const std::unique_ptr<TaskStore> peer = openStore(":memory:");
+    const std::unique_ptr<TaskStore> local = openStore(":memory:");
+    ASSERT_NE(nullptr, peer);
+    ASSERT_NE(nullptr, local);
+
+    // A peer whose clock runs ahead: a fast clock, a laptop resumed from suspend,
+    // a VM restored from a snapshot. An hour is far more than this case takes to
+    // run, so the row stays "stamped in the future" for its whole duration, and
+    // the stamp is well inside the window a transported stamp has to be in.
+    const std::string uid = newUid();
+    const std::int64_t created = systemNow();
+    const std::int64_t ahead = created + 3600;
+    ASSERT_EQ(1U, okValue(peer->mergeJsonl(liveRecord(uid, "from the fast peer", created, ahead) + "\n",
+                                           false),
+                          MergeReport{}, "mergeJsonl")
+                      .inserted);
+
+    // What this machine receives is the OTHER machine's export, not a hand-built
+    // record: the case is about a real sync, and the imported row keeps the
+    // peer's stamp verbatim (that is what makes the row's stamp the peer's
+    // clock rather than ours).
+    const std::string peer_export = okValue(peer->exportJsonl(), std::string{}, "exportJsonl");
+    ASSERT_EQ(1U, okValue(local->mergeJsonl(peer_export, false), MergeReport{}, "mergeJsonl").inserted);
+    const Task row = okValue(local->getTaskByUid(uid), Task{}, "getTaskByUid");
+    ASSERT_EQ(ahead, row.updated_at);
+
+    // The local edit. Stamp the row with this machine's own clock and the result
+    // is an hour older than what the row already carried.
+    TaskPatch retitle;
+    retitle.title = "edited here";
+    const Task edited = okValue(local->updateTask(row.id, retitle), Task{}, "updateTask");
+    EXPECT_EQ("edited here", edited.title);
+    EXPECT_GT(edited.updated_at, ahead)
+        << "a local write moved the row's stamp backwards, so the export now advertises a "
+           "record older than the one it was derived from";
+
+    // The peer's export, re-imported unchanged: it still carries the row as it
+    // was BEFORE the edit. This is the user-visible failure — an edit stamped
+    // with the local clock looked older than the record it came from, so the
+    // merge took the peer's version and the change disappeared on the machine
+    // that made it.
+    const MergeReport back =
+        okValue(local->mergeJsonl(peer_export, false), MergeReport{}, "mergeJsonl");
+    EXPECT_TRUE(back.clean());
+    EXPECT_EQ(0U, back.updated);
+    EXPECT_EQ(1U, back.skipped);
+    const Task survived = okValue(local->getTaskByUid(uid), Task{}, "getTaskByUid");
+    EXPECT_EQ("edited here", survived.title)
+        << "the local edit was overwritten by the record it came from";
+    EXPECT_EQ(edited.updated_at, survived.updated_at);
+
+    // The edit then travels, which is what the fix also buys: the peer takes it
+    // on the next sync. An incoming record older than the row it already holds
+    // is skipped, so on the old stamping the peer never learned about it either.
+    const MergeReport to_peer = mergeFrom(*local, *peer);
+    EXPECT_EQ(1U, to_peer.updated);
+    EXPECT_EQ("edited here", okValue(peer->getTaskByUid(uid), Task{}, "getTaskByUid").title);
+}
+
+TEST(TaskStoreTest, DeletingARowFromAFastClockPeerStampsTheTombstoneAheadOfIt)
+{
+    const std::unique_ptr<TaskStore> peer = openStore(":memory:");
+    const std::unique_ptr<TaskStore> local = openStore(":memory:");
+    ASSERT_NE(nullptr, peer);
+    ASSERT_NE(nullptr, local);
+
+    // The task arrived from a machine whose clock is an hour ahead, so the row
+    // carries a stamp this machine's own clock has not reached.
+    const std::string uid = newUid();
+    const std::int64_t created = systemNow();
+    const std::int64_t ahead = created + 3600;
+    ASSERT_EQ(1U, okValue(peer->mergeJsonl(liveRecord(uid, "delete me", created, ahead) + "\n", false),
+                          MergeReport{}, "mergeJsonl")
+                      .inserted);
+    const std::string peer_export = okValue(peer->exportJsonl(), std::string{}, "exportJsonl");
+    ASSERT_EQ(1U, okValue(local->mergeJsonl(peer_export, false), MergeReport{}, "mergeJsonl").inserted);
+
+    const Task doomed = okValue(local->getTaskByUid(uid), Task{}, "getTaskByUid");
+    ASSERT_EQ(ahead, doomed.updated_at);
+    expectOk(local->deleteTask(doomed.id), "deleteTask");
+
+    // The tombstone's stamp, read back through the export the next machine will
+    // see. It has to be strictly greater than the row's: a tombstone wins only a
+    // tie or better, so one born older than the row it removes is skipped by
+    // every merge and the deletion never travels at all.
+    const std::string local_export = okValue(local->exportJsonl(), std::string{}, "exportJsonl");
+    const std::vector<std::string> lines = splitLines(local_export);
+    ASSERT_EQ(1U, lines.size());
+    const nlohmann::json record = nlohmann::json::parse(lines.front());
+    ASSERT_TRUE(record.at("deleted").get<bool>());
+    const std::int64_t deleted_at = record.at("updated_at").get<std::int64_t>();
+    EXPECT_GT(deleted_at, ahead) << "the tombstone was born older than the row it removed";
+
+    // The direction that used to lose the deletion: the peer still holds the live
+    // task, at the old stamp. It has to be removed there.
+    const MergeReport carried = mergeFrom(*local, *peer);
+    EXPECT_EQ(1U, carried.deleted);
+    EXPECT_EQ(0U, carried.resurrected) << "the peer kept the task instead of deleting it";
+    EXPECT_FALSE(peer->getTaskByUid(uid).ok());
+    EXPECT_EQ(1U, okValue(peer->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
+
+    // And the echo cannot bring the task back on the machine that deleted it,
+    // which is what an older tombstone caused: the peer's live row was strictly
+    // newer than the tombstone, so kResurrect won and the deletion undid itself.
+    const MergeReport echo = mergeFrom(*peer, *local);
+    EXPECT_TRUE(echo.clean());
+    EXPECT_FALSE(local->getTaskByUid(uid).ok()) << "the deleted task came back";
+    EXPECT_EQ(1U, okValue(local->tombstoneCount(), std::size_t{0}, "tombstoneCount"));
+}
+
+TEST(TaskStoreTest, UidBackfillDerivesTheSameIdentitiesOnTwoCopies)
+{
+    const TempDir directory;
+    const std::string first_path = directory.file("machine_a.db");
+    const std::string second_path = directory.file("machine_b.db");
+
+    // The same pre-uid backlog, twice: one database copied to another machine —
+    // a restored backup, an rsync, a file carried on a stick. The rows, their
+    // local ids and their timestamps are identical, and no human decided
+    // anything, so no machine may distinguish them from one another.
+    ASSERT_TRUE(buildVersionZeroDatabase(first_path)) << "could not plant the first copy";
+    ASSERT_TRUE(buildVersionZeroDatabase(second_path)) << "could not plant the second copy";
+
+    const std::unique_ptr<TaskStore> first = openStore(first_path);
+    const std::unique_ptr<TaskStore> second = openStore(second_path);
+    ASSERT_NE(nullptr, first);
+    ASSERT_NE(nullptr, second);
+
+    // Each machine migrates on its own, and both must arrive at the SAME uid for
+    // every row. A freshly generated value per row and per machine is the defect
+    // this pins: the two copies then assert identities neither has seen, every
+    // row arrives as new on the other machine, and the first sync inserts a
+    // second copy of the whole backlog.
+    const std::vector<Task> first_tasks = tasksByUid(*first);
+    ASSERT_EQ(2U, first_tasks.size());
+    for (const Task &task : first_tasks) {
+        const Task same_row = okValue(second->getTask(task.id), Task{}, "getTask");
+        EXPECT_EQ(task.title, same_row.title) << "row " << task.id << " is not the same row";
+        EXPECT_EQ(task.uid, same_row.uid)
+            << "row " << task.id << " was given a different identity on each copy";
+        EXPECT_TRUE(looksLikeUuidV4(task.uid)) << "derived uid is not a v4 uuid: " << task.uid;
+    }
+    EXPECT_NE(first_tasks.front().uid, first_tasks.back().uid) << "two rows share one identity";
+
+    // The property the derivation buys: the first sync between the two copies is
+    // a clean no-op. Both directions are checked because a first sync runs in
+    // whichever order the operator happens to run it.
+    const MergeReport into_second = mergeFrom(*first, *second);
+    EXPECT_TRUE(into_second.clean()) << "the same rows arrived as new tasks on the other machine";
+    EXPECT_EQ(2U, into_second.skipped);
+    EXPECT_EQ(0U, into_second.inserted);
+    EXPECT_EQ(2U, tasksByUid(*second).size()) << "the merge duplicated the backlog";
+
+    EXPECT_TRUE(mergeFrom(*second, *first).clean());
+    EXPECT_EQ(2U, tasksByUid(*first).size());
+    // Both sides now hold literally the same file, which is what a sync that
+    // recognises every row looks like from the outside.
+    EXPECT_EQ(okValue(first->exportJsonl(), std::string{}, "exportJsonl"),
+              okValue(second->exportJsonl(), std::string{}, "exportJsonl"));
+
+    // Reopening re-derives nothing: the ids are already assigned, so a second
+    // open cannot re-identify rows a peer has already learned.
+    const std::unique_ptr<TaskStore> reopened = openStore(first_path);
+    ASSERT_NE(nullptr, reopened);
+    const std::vector<Task> reopened_tasks = tasksByUid(*reopened);
+    ASSERT_EQ(first_tasks.size(), reopened_tasks.size());
+    for (std::size_t index = 0; index < reopened_tasks.size(); ++index) {
+        EXPECT_EQ(first_tasks[index].uid, reopened_tasks[index].uid);
+    }
 }
 
 TEST(TaskStoreTest, DryRunReportsTheMergeWithoutPerformingIt)
@@ -1973,6 +2293,7 @@ TEST(TaskStoreTest, MergeReportSerializesWithStableKeys)
     report.deleted = 3;
     report.resurrected = 4;
     report.skipped = 5;
+    report.stamps_adjusted = 6;
     report.inserted_titles = { "a", "b" };
     report.deleted_titles = { "gone" };
 
@@ -1982,12 +2303,13 @@ TEST(TaskStoreTest, MergeReportSerializesWithStableKeys)
     EXPECT_EQ(3, json.at("deleted").get<int>());
     EXPECT_EQ(4, json.at("resurrected").get<int>());
     EXPECT_EQ(5, json.at("skipped").get<int>());
+    EXPECT_EQ(6, json.at("stamps_adjusted").get<int>());
     EXPECT_EQ(2U, json.at("inserted_titles").size());
     EXPECT_EQ(1U, json.at("deleted_titles").size());
     EXPECT_TRUE(json.at("updated_titles").empty());
     EXPECT_TRUE(json.at("resurrected_titles").empty());
     EXPECT_FALSE(json.at("clean").get<bool>());
-    EXPECT_EQ(10U, json.size()); // five counts, four title lists, and clean
+    EXPECT_EQ(11U, json.size()); // six counts, four title lists, and clean
 
     // A report with nothing to do is the common case (a no-op sync), and it
     // says so in both places a caller might look.

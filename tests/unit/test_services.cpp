@@ -12,6 +12,12 @@
 //      advertised name and forbids only the "unknown method" answer.
 //   2. "now" is sampled once per call. Every score assertion therefore runs
 //      against a clock the test controls, and one test counts the samples.
+//   3. An undeclared parameter is refused, for every method. A key the method's
+//      schema does not declare used to be ignored, so a mistyped filter
+//      answered a question the caller had not asked; the catalog is iterated in
+//      the tests below so a method added later is covered without a new test,
+//      and both halves — the refusal and the happy path — are asserted, because
+//      a check that refused everything would pass a refusal-only test.
 
 #include <algorithm>
 #include <atomic>
@@ -417,26 +423,69 @@ TEST_F(ServicesTest, TheQueueCanExcludeWorkAlreadyInProgress)
     EXPECT_EQ(openOnly.at("queue").front().at("title").get<std::string>(), "not started");
 }
 
-TEST_F(ServicesTest, TiedScoresAreBrokenByAgeThenId)
+TEST_F(ServicesTest, TiedScoresBreakDeterministicallyByUid)
 {
     // Two identical tasks: same importance, same (absent) deadline, same (zero)
-    // blocks, and ages that are equal to within the rounding of the store's
-    // own clock. The order must still be fully determined — the first task
-    // created has both the older created_at and the lower id — because an
-    // order that depends on the input order or on the sort implementation is
-    // not reproducible.
+    // blocks, and created within the same wall-clock second — so created_at
+    // ties as well as the score, and the THIRD key is what decides.
+    //
+    // That key is the uid. It used to be the local row id, which is the one
+    // thing it must not be: the id is a per-machine row number (docs/sync.md),
+    // so ordering by it makes the queue differ between two machines holding the
+    // same backlog. Hence the rename from "...ThenId".
+    //
+    // The uid is RANDOM, so the expectation is derived from it rather than
+    // hard-coded — a fixed order here would pass only by luck. What is asserted
+    // is that the pair really is ordered by ascending uid and that the order is
+    // reproducible; the focused tie-break tests live in
+    // test_priority_engine.cpp, which can control the uids directly.
     addTask(harness.services, "first");
     addTask(harness.services, "second");
 
     const nlohmann::json queue = callOk(harness.services, "get_queue");
     ASSERT_EQ(queue.at("queue").size(), 2U);
-    EXPECT_EQ(queue.at("queue").at(0).at("title").get<std::string>(), "first");
-    EXPECT_EQ(queue.at("queue").at(1).at("title").get<std::string>(), "second");
-    // The ages differ by at most a second of wall time, so the scores are
-    // equal to within that: this really is a tie, broken by the tie-breakers
-    // rather than by a term.
+
+    const std::string uid0 = queue.at("queue").at(0).at("uid").get<std::string>();
+    const std::string uid1 = queue.at("queue").at(1).at("uid").get<std::string>();
+    const std::string title0 = queue.at("queue").at(0).at("title").get<std::string>();
+    const std::string title1 = queue.at("queue").at(1).at("title").get<std::string>();
+
+    // Derive the expected order from the documented keys instead of assuming
+    // which one decides. The two creates usually land in one second, so
+    // created_at ties and the uid runs — but when they straddle a second
+    // boundary, created_at separates them first and the uid never gets a say.
+    // Assuming the tie is what made this test fail about one run in fifty.
+    const std::int64_t created0 = queue.at("queue").at(0).at("created_at").get<std::int64_t>();
+    const std::int64_t created1 = queue.at("queue").at(1).at("created_at").get<std::int64_t>();
+    const bool uid_decides = (created0 == created1);
+    const bool ok_order = uid_decides ? (uid0 < uid1) : (created0 < created1);
+
+    EXPECT_TRUE(ok_order)
+        << (uid_decides ? "same created_at, so the pair must ascend by uid"
+                        : "different created_at, so the older must come first")
+        << "; got uid " << uid0 << " then " << uid1 << ", created_at " << created0
+        << " then " << created1 << " (" << title0 << " / " << title1 << ")";
+
+    // The ages differ by at most a second of wall time, so the scores are equal
+    // to within that: this really is a tie, broken by the tie-breakers rather
+    // than by a term.
     EXPECT_NEAR(queue.at("queue").at(0).at("score").get<double>(),
                 queue.at("queue").at(1).at("score").get<double>(), 1e-3);
+
+    // Reproducible: a second read gives the identical order. Comparing the uids
+    // rather than the whole entries keeps this independent of the wall clock.
+    const nlohmann::json again = callOk(harness.services, "get_queue");
+    std::vector<std::string> order_first;
+    std::vector<std::string> order_again;
+    for (const nlohmann::json &entry : queue.at("queue"))
+    {
+        order_first.push_back(entry.at("uid").get<std::string>());
+    }
+    for (const nlohmann::json &entry : again.at("queue"))
+    {
+        order_again.push_back(entry.at("uid").get<std::string>());
+    }
+    EXPECT_EQ(order_first, order_again);
 }
 
 TEST_F(ServicesTest, CompletedTasksLeaveTheQueueAndReopeningRestoresThem)
@@ -707,13 +756,15 @@ TEST_F(ServicesTest, GetStatsAdvertisesNoLimitAndAgreesWithTheQueueHead)
     EXPECT_DOUBLE_EQ(stats.at("top_score").get<double>(),
                      queue.at("queue").front().at("score").get<double>());
 
-    // A leftover `limit` in a client's request is now just an undeclared key,
-    // which every method ignores; what it must never do again is look like it
-    // had an effect.
-    const nlohmann::json stray = callOk(harness.services, "get_stats", { { "limit", 1 } });
-    EXPECT_DOUBLE_EQ(stray.at("top_score").get<double>(), stats.at("top_score").get<double>());
-    EXPECT_EQ(stray.at("top_title").get<std::string>(), stats.at("top_title").get<std::string>());
-    EXPECT_EQ(stray.at("open").get<std::size_t>(), stats.at("open").get<std::size_t>());
+    // A leftover `limit` in a client's request must never look like it had an
+    // effect, and it no longer can: an undeclared key is refused by name rather
+    // than ignored, so a caller that still sends the parameter it remembers
+    // from an older version is told there is no such parameter here. Ignoring
+    // it would be the quieter failure — a knob that silently does nothing is
+    // indistinguishable from one that worked.
+    const Error stray = callError(harness.services, "get_stats", { { "limit", 1 } });
+    EXPECT_EQ(ErrorCode::kInvalidArgument, stray.code);
+    EXPECT_NE(std::string::npos, stray.message.find("limit"));
 }
 
 TEST_F(ServicesTest, SetWeightsMergesOntoTheStoredWeights)
@@ -1224,6 +1275,198 @@ TEST_F(ServicesTest, AClientSuppliedNowIsOverwrittenRatherThanTrusted)
     EXPECT_DOUBLE_EQ(forged.at("queue").front().at("score_parts").at("urgency").get<double>(),
                      30.0);
     EXPECT_DOUBLE_EQ(honest.at("queue").front().at("score").get<double>(), 77.0);
+}
+
+TEST_F(ServicesTest, EveryMethodRefusesAnUndeclaredParameter)
+{
+    // Iterating the catalog, like the dispatch cross-check above, so a method
+    // added later is covered the moment it is advertised. The key is spelled
+    // so that it is a substring of no declared parameter name, which keeps
+    // "the message names the offending key" from being satisfied by the
+    // accepted list that follows it in the same message.
+    constexpr const char *kUndeclared{ "zzz_undeclared_parameter" };
+
+    for (const MethodSpec &spec : Services::methodSpecs())
+    {
+        const Error failure = callError(harness.services, spec.name, { { kUndeclared, 1 } });
+
+        EXPECT_EQ(ErrorCode::kInvalidArgument, failure.code)
+            << spec.name << " ignored an undeclared parameter: " << failure.message;
+        EXPECT_NE(std::string::npos, failure.message.find(kUndeclared))
+            << spec.name << " did not name the offending key: " << failure.message;
+
+        // Every key the method DOES accept is listed back. That list is the
+        // half a caller can act on: a model writing JSON by hand can correct
+        // the request in one turn instead of bisecting it against the docs.
+        const nlohmann::json &properties = spec.params_schema.at("properties");
+        for (auto property = properties.begin(); property != properties.end(); ++property)
+        {
+            EXPECT_NE(std::string::npos, failure.message.find(property.key()))
+                << spec.name << " did not list its accepted parameter '" << property.key()
+                << "': " << failure.message;
+        }
+
+        // A method that takes no parameters has to refuse ANY key, and say so:
+        // an empty accepted list would read like a formatting bug rather than
+        // as an answer.
+        if (properties.empty())
+        {
+            EXPECT_NE(std::string::npos, failure.message.find("accepts no parameters"))
+                << spec.name << ": " << failure.message;
+        }
+    }
+}
+
+TEST_F(ServicesTest, EveryMethodStillAcceptsItsOwnDeclaredParameters)
+{
+    // The other half of the contract, and the reason the check cannot be
+    // "satisfied" by refusing everything: a call whose keys are ALL declared
+    // still has to work. One valid sample per method, looked up by name, so a
+    // method with no sample fails here instead of being skipped silently.
+    const nlohmann::json toUpdate = addTask(harness.services, "update me");
+    const nlohmann::json toComplete = addTask(harness.services, "complete me");
+    const nlohmann::json toReopen = addTask(harness.services, "reopen me");
+    const nlohmann::json toDelete = addTask(harness.services, "delete me");
+    const nlohmann::json toFetch = addTask(harness.services, "fetch me");
+    const std::int64_t now = harness.clock.nowEpochSeconds();
+    // This machine's own export, as the document import_tasks is given: a real,
+    // non-empty file rather than an empty string, so the sample exercises the
+    // merge path instead of its degenerate case. It is merged as a dry run, so
+    // nothing above changes.
+    const nlohmann::json ownExport = callOk(harness.services, "export_tasks");
+
+    struct Sample
+    {
+        const char *method;
+        nlohmann::json params;
+    };
+    const std::vector<Sample> samples{
+        { "get_status", nlohmann::json::object() },
+        { "describe_methods", nlohmann::json::object() },
+        { "add_task",
+          nlohmann::json{ { "title", "sampled" },
+                          { "importance", 2 },
+                          { "due_at", now + kSecondsPerDay },
+                          { "blocks", 1 },
+                          { "tags", nlohmann::json::array({ "sample" }) },
+                          { "notes", "sampled notes" } } },
+        { "update_task",
+          nlohmann::json{ { "id", toUpdate.at("id") },
+                          { "title", "renamed" },
+                          { "notes", "" },
+                          { "importance", 4 },
+                          { "due_at", now },
+                          { "blocks", 2 },
+                          { "tags", nlohmann::json::array({ "renamed" }) },
+                          { "status", "in_progress" } } },
+        { "complete_task", nlohmann::json{ { "id", toComplete.at("id") } } },
+        { "reopen_task", nlohmann::json{ { "id", toReopen.at("id") } } },
+        { "delete_task", nlohmann::json{ { "id", toDelete.at("id") } } },
+        { "get_queue", nlohmann::json{ { "limit", 1 }, { "include_in_progress", true } } },
+        { "list_tasks",
+          nlohmann::json{ { "status", "open" },
+                          { "tag", "sample" },
+                          { "limit", 1 },
+                          { "order", "created" } } },
+        { "get_task", nlohmann::json{ { "id", toFetch.at("id") } } },
+        { "get_stats", nlohmann::json::object() },
+        { "export_tasks", nlohmann::json::object() },
+        { "import_tasks",
+          nlohmann::json{ { "jsonl", ownExport.at("jsonl") }, { "dry_run", true } } },
+        { "get_weights", nlohmann::json::object() },
+        { "set_weights", nlohmann::json{ { "importance", 6.0 } } },
+    };
+
+    for (const MethodSpec &spec : Services::methodSpecs())
+    {
+        const auto sample =
+            std::find_if(samples.begin(), samples.end(), [&spec](const Sample &candidate) {
+                return spec.name == candidate.method;
+            });
+        ASSERT_NE(samples.end(), sample)
+            << spec.name << " has no valid sample here: add one, or the check could start "
+                           "refusing a declared parameter with nothing to notice";
+
+        // The sample may not smuggle in an undeclared key either, or it would
+        // pass only because the check was broken.
+        const nlohmann::json &properties = spec.params_schema.at("properties");
+        for (auto entry = sample->params.begin(); entry != sample->params.end(); ++entry)
+        {
+            EXPECT_TRUE(properties.contains(entry.key()))
+                << spec.name << "'s sample uses undeclared key '" << entry.key() << "'";
+        }
+
+        const RpcResult result = harness.services.invoke(spec.name, sample->params);
+        if (!result.ok())
+        {
+            ADD_FAILURE() << spec.name << " refused a call whose keys are all declared: "
+                          << result.error().message;
+        }
+    }
+
+    // update_task is the one method whose sample cannot carry every declared
+    // key: due_at and clear_due_at together are the documented conflict, so a
+    // sample holding both would be refused for a reason that has nothing to do
+    // with this check. The other half of that pair gets its own call.
+    const RpcResult cleared = harness.services.invoke(
+        "update_task", nlohmann::json{ { "id", toFetch.at("id") }, { "clear_due_at", true } });
+    if (!cleared.ok())
+    {
+        ADD_FAILURE() << "clear_due_at was refused as an undeclared parameter: "
+                      << cleared.error().message;
+    }
+}
+
+TEST_F(ServicesTest, TheReservedNowKeyIsNotAnUndeclaredParameter)
+{
+    // invoke() stamps __taskpilot_now into the params of EVERY call, and the
+    // handlers read it from there, so a check that tripped on the reserved key
+    // would refuse every request in this file — including calls to methods that
+    // take no parameters, where the stamp is the only key in the object.
+    // get_status is that sharpest case.
+    const nlohmann::json status =
+        callOk(harness.services, "get_status", { { "__taskpilot_now", 0 } });
+    EXPECT_EQ(status.at("now").get<std::int64_t>(), harness.clock.nowEpochSeconds());
+
+    // The exemption is for the reserved key alone, and it is invisible: a stray
+    // key beside it is still named, while the reserved name — which the caller
+    // never sent — must not appear in the complaint about it.
+    const Error failure = callError(
+        harness.services, "get_stats", { { "__taskpilot_now", 1 }, { "zzz_undeclared", 1 } });
+    EXPECT_EQ(ErrorCode::kInvalidArgument, failure.code);
+    EXPECT_NE(std::string::npos, failure.message.find("zzz_undeclared"));
+    EXPECT_EQ(std::string::npos, failure.message.find("__taskpilot_now")) << failure.message;
+}
+
+TEST_F(ServicesTest, AMistypedListTasksFilterIsRefusedRatherThanIgnored)
+{
+    // The defect this check exists for, in the shape it was found: list_tasks
+    // with a mistyped filter key returned the whole backlog. The caller (usually
+    // a model writing JSON by hand) asked for one status, got every task, and
+    // had nothing in the reply to tell it the filter had never run — the worst
+    // kind of failure, because the answer looks like a good one.
+    addTask(harness.services, "still open");
+    const nlohmann::json finished = addTask(harness.services, "already done");
+    callOk(harness.services, "complete_task", { { "id", finished.at("id") } });
+
+    const Error mistyped = callError(harness.services, "list_tasks", { { "statsu", "done" } });
+    EXPECT_EQ(ErrorCode::kInvalidArgument, mistyped.code);
+    EXPECT_NE(std::string::npos, mistyped.message.find("statsu"));
+    // The accepted names come back with the refusal, which is what the caller
+    // needs in order to fix it without a documentation lookup.
+    EXPECT_NE(std::string::npos, mistyped.message.find("status"));
+
+    // The correctly spelled key alone still filters: the refusal is about the
+    // undeclared key, not a blanket rejection of filtered queries.
+    ASSERT_EQ(callOk(harness.services, "list_tasks", { { "status", "done" } }).size(), 1U);
+
+    // And a request carrying both — the filter the caller meant and the typo it
+    // made as well — is an error rather than a query in which one filter
+    // silently did nothing.
+    const Error partial = callError(
+        harness.services, "list_tasks", { { "status", "done" }, { "statsu", "open" } });
+    EXPECT_EQ(ErrorCode::kInvalidArgument, partial.code);
+    EXPECT_NE(std::string::npos, partial.message.find("statsu"));
 }
 
 TEST(ServicesClockTest, TheClockIsSampledOncePerCall)

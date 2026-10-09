@@ -7,10 +7,21 @@
 #   ./run.sh serve           run the backend daemon (foreground)
 #   ./run.sh mcp             run the stdio MCP bridge (used by Claude Code)
 #   ./run.sh cli             attach an interactive REPL to a running daemon
+#   ./run.sh export          write the backlog as JSONL (stdout by default;
+#                            --out <path> writes a file instead)
+#   ./run.sh import          merge a JSONL export (DRY RUN unless --apply;
+#                            --file <path> reads a file instead of stdin)
 #   ./run.sh version         print the version
 #
 # The daemon and the MCP bridge are the same binary, so a rebuild can never
 # leave them from different versions.
+#
+# `export` is a DATA PIPE: with no --out it writes the JSONL to stdout, so this
+# script must never add a line there. Its own progress goes to stderr (see
+# log() below) and the binary is exec'd rather than wrapped, so a redirected
+# `./run.sh export > backlog.jsonl` receives the binary's own bytes.
+# `import` is a DRY RUN unless the caller passes --apply: the wrapper supplies
+# no flag of its own and forwards "$@" untouched, so the default survives it.
 
 set -euo pipefail
 
@@ -74,11 +85,14 @@ case "$cmd" in
         log "removing ${BUILD_DIR}"
         rm -rf "$BUILD_DIR"
         ;;
-    serve|mcp|cli|version)
+    # Client subcommands, one binary: build if anything changed, then `exec` it
+    # with the flags this script never inspects. exec — not a wrapper call —
+    # keeps export's stdout pure, because with no --out that stdout IS the JSONL.
+    serve|mcp|cli|export|import|version)
         needs_build && do_build
         exec "$BIN" "$cmd" "$@"
         ;;
     *)
-        die "unknown command: ${cmd} (try: build|test|serve|mcp|cli|version|clean)"
+        die "unknown command: ${cmd} (try: build|test|serve|mcp|cli|export|import|version|clean)"
         ;;
 esac

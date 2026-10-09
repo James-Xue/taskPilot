@@ -164,6 +164,11 @@ struct ServerStopper
 struct QueueEntry
 {
     std::int64_t id{ 0 };
+    /// The cross-machine identity. Carried here because the FINAL tie-break is
+    /// the uid and not the id (see PriorityEngine::rank), and the uid is random
+    /// — so a test that asserts an order among tied tasks has to derive the
+    /// expectation from this value rather than hard-code one.
+    std::string uid;
     double score{ 0.0 };
     double urgency_factor{ 0.0 };
     double importance_part{ 0.0 };
@@ -300,6 +305,12 @@ class DaemonRoundtripTest : public ::testing::Test
             }
 
             entry.id = raw["id"].get<std::int64_t>();
+            if (!raw.contains("uid") || !raw["uid"].is_string())
+            {
+                ADD_FAILURE() << "queue entry without a uid: " << raw.dump();
+                continue;
+            }
+            entry.uid = raw["uid"].get<std::string>();
             entry.score = numberField(raw, "score");
             entry.urgency_factor = numberField(raw, "urgency_factor");
 
@@ -467,17 +478,36 @@ TEST_F(DaemonRoundtripTest, RankedQueueFollowsTheScoringDocument)
 
     // --- 2. blocks dominates ----------------------------------------------
     // C blocks five others, so it takes the front; the remaining three score
-    // exactly 0, which is where scoring.md's SECOND tie-breaker shows up:
-    // equal scores fall back to the older created_at and then to the lower id.
-    // A, B and D were created in that order, so that is the expected order
-    // whichever of the two keys ends up deciding it.
+    // exactly 0, which is where the tie-breakers show up: equal scores fall
+    // back to the older created_at, and then to the uid.
+    //
+    // A, B and D are created within the same wall-clock second, so created_at
+    // ties as well and the uid is what actually decides. The uid is RANDOM, so
+    // the expectation is derived from it rather than hard-coded — a fixed
+    // order here would pass only by luck. Note that the third key is the uid
+    // and NOT the local id: the id is a per-machine row number (docs/sync.md),
+    // so ordering by it would make the queue differ between two machines
+    // holding the same backlog. The uid tie-break has its own focused unit
+    // tests in test_priority_engine.cpp; what this asserts is that it survives
+    // the whole stack out to a real socket.
     setWeights(0.0, 0.0, 0.0, 100.0);
     const std::vector<QueueEntry> by_blocks = queueEntries(queueJson());
     ASSERT_EQ(4u, by_blocks.size());
-    EXPECT_EQ((std::vector<std::int64_t>{ seeded.c, seeded.a, seeded.b, seeded.d }),
-              idsOf(by_blocks));
+    EXPECT_EQ(seeded.c, by_blocks[0].id);
     EXPECT_DOUBLE_EQ(500.0, by_blocks[0].score);
     EXPECT_DOUBLE_EQ(0.0, by_blocks[1].score);
+
+    // The tied tail: exactly A, B and D, ordered by uid ascending.
+    std::vector<QueueEntry> tail{ by_blocks[1], by_blocks[2], by_blocks[3] };
+    std::vector<QueueEntry> expected{ tail };
+    std::sort(expected.begin(), expected.end(),
+              [](const QueueEntry &lhs, const QueueEntry &rhs) { return lhs.uid < rhs.uid; });
+    EXPECT_EQ(idsOf(expected), idsOf(tail));
+
+    std::vector<std::int64_t> tied_ids = idsOf(tail);
+    std::sort(tied_ids.begin(), tied_ids.end());
+    EXPECT_EQ((std::vector<std::int64_t>{ seeded.a, seeded.b, seeded.d }), tied_ids);
+
     expectDescendingScores(by_blocks);
 
     // --- 3. urgency dominates ---------------------------------------------
@@ -488,8 +518,22 @@ TEST_F(DaemonRoundtripTest, RankedQueueFollowsTheScoringDocument)
     setWeights(0.0, 100.0, 0.0, 0.0);
     const std::vector<QueueEntry> by_urgency = queueEntries(queueJson());
     ASSERT_EQ(4u, by_urgency.size());
-    EXPECT_EQ((std::vector<std::int64_t>{ seeded.b, seeded.c, seeded.a, seeded.d }),
-              idsOf(by_urgency));
+
+    // B and C are separated by the urgency term itself. A and D BOTH score
+    // exactly 0.0 (one beyond the horizon, one with no deadline) AND are created
+    // within the same wall-clock second, so the uid decides — and the uid is
+    // RANDOM, so their order is derived rather than hard-coded. Asserting a
+    // fixed pair here is what made this test fail on roughly half of all runs
+    // after the tie-break moved from the local id to the uid, which made the
+    // whole suite's red/green signal untrustworthy.
+    EXPECT_EQ(seeded.b, by_urgency[0].id);
+    EXPECT_EQ(seeded.c, by_urgency[1].id);
+
+    std::vector<std::int64_t> tied_pair{ by_urgency[2].id, by_urgency[3].id };
+    std::sort(tied_pair.begin(), tied_pair.end());
+    EXPECT_EQ((std::vector<std::int64_t>{ seeded.a, seeded.d }), tied_pair);
+    EXPECT_LT(by_urgency[2].uid, by_urgency[3].uid)
+        << "the tied pair must ascend by uid (the tier groups D and A)";
 
     EXPECT_DOUBLE_EQ(1.0, by_urgency[0].urgency_factor) << "an overdue task saturates at 1.0";
     EXPECT_NEAR(1.0 - (3.0 / 7.0), by_urgency[1].urgency_factor, 0.001);

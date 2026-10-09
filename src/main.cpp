@@ -91,6 +91,29 @@ constexpr std::uint16_t kDefaultPort{ 8091 };
 /// rule it is instead of a magic number.
 constexpr unsigned long kMaxPort{ 65535UL };
 
+/// The control-socket method that returns the whole backlog. Named once because
+/// two call sites depend on the same string: the export subcommand invokes it,
+/// and the MCP bridge has to recognise it to pick the reply cap below.
+constexpr const char *kExportTasksMethod{ "export_tasks" };
+
+/// Reply cap for the one control-socket call whose answer is the whole backlog.
+///
+/// ControlClient defaults to capping a reply at 1 MiB (kDefaultMaxReplyBytes),
+/// which is right for every call that answers with a bounded document and wrong
+/// for export_tasks: that reply IS the backlog — one JSONL record per task — so
+/// it grows as long as the user keeps adding tasks, and once it passes the cap
+/// the export fails every time and takes the whole synchronisation workflow
+/// with it, because a document that has to arrive as one line cannot be paged.
+///
+/// 64 MiB, sized from the record rather than from today's backlog: a record is
+/// a few hundred bytes of JSON (a title, notes, timestamps), so this holds on
+/// the order of a hundred thousand tasks — an order of magnitude past anything
+/// a personal backlog reaches. It is not a size policy and not "no limit":
+/// like the default it is a runaway guard, chosen so a legitimate export never
+/// meets it while a peer that streams without ever sending a newline still runs
+/// out of a bound rather than of memory.
+constexpr std::size_t kExportMaxReplyBytes{ 64 * 1024 * 1024 };
+
 /// Effective configuration.
 ///
 /// Precedence, lowest to highest: the defaults below, then the environment,
@@ -603,16 +626,44 @@ void reportRpcFailure(const Error &error)
     return 0;
 }
 
+/// The reply cap for one control-socket method.
+///
+/// For the MCP bridge, which forwards every tool in the catalog and so cannot
+/// choose a cap once for the process: export_tasks returns the whole backlog
+/// (see kExportMaxReplyBytes) while every other tool answers with a document
+/// bounded by what it was asked for. Keeping the default for those is the point
+/// of having a default — a runaway reply there should cost a megabyte, not
+/// sixty-four.
+[[nodiscard]] std::size_t replyCapFor(const std::string &method)
+{
+    if (kExportTasksMethod == method)
+    {
+        return kExportMaxReplyBytes;
+    }
+    return kDefaultMaxReplyBytes;
+}
+
 /// `mcp` — stdio MCP bridge over the control socket.
 [[nodiscard]] int runMcp(const Config &config)
 {
-    const ControlClient client(config.bind_address, config.port);
-
     // Every tools/call is forwarded to the daemon, which stays the single
     // writer. The bridge owning no store is what makes a restarted `mcp`
     // process impossible to diverge from the daemon's view.
-    McpServer::Backend backend = [&client](const std::string &method, const nlohmann::json &params)
-    { return client.call(method, params); };
+    //
+    // A client per call, built inside the backend, because the reply cap
+    // follows the METHOD rather than the process — the bridge serves the whole
+    // catalog and export_tasks is the one tool whose reply is the whole backlog
+    // (see replyCapFor). A ControlClient holds nothing between calls: it dials
+    // per call, so sharing one would not save a connect or warm anything up.
+    // The reference to `config` is the only lifetime this needs, and it
+    // outlives runMcp because main() owns the Invocation.
+    McpServer::Backend backend = [&config](const std::string &method,
+                                           const nlohmann::json &params)
+    {
+        const ControlClient client(config.bind_address, config.port, kDefaultTimeoutMs,
+                                   replyCapFor(method));
+        return client.call(method, params);
+    };
 
     McpServer server(std::move(backend), ServerInfo{ "taskpilot", kVersion });
 
@@ -621,7 +672,8 @@ void reportRpcFailure(const Error &error)
     // client still discovers every tool and sees the real error on the call.
     // Exiting here instead would present the user with an empty tool list and
     // no explanation at all.
-    if (!client.ping())
+    const ControlClient probe(config.bind_address, config.port);
+    if (!probe.ping())
     {
         std::cerr << kProgramName << ": warning: no daemon is listening on " << config.bind_address
                   << ":" << config.port << "\n";
@@ -676,9 +728,18 @@ void reportRpcFailure(const Error &error)
     // No ping() first: a missing daemon is reported by the call itself, with
     // the command that fixes it, and a probe would only open a window in which
     // the daemon can exit between the probe and the call.
-    const ControlClient client(config.bind_address, config.port);
+    //
+    // The raised reply cap is what makes this client different from every other
+    // one in this file (see kExportMaxReplyBytes): export_tasks answers with
+    // the whole backlog, and once that reply outgrows the default the call does
+    // not degrade — it fails, every time, for a backlog that only ever grows.
+    // The timeout is left at the client's default, because the cap is a size
+    // question and the deadline a liveness one; it is spelled out because the
+    // parameter list is positional and the cap cannot be reached without it.
+    const ControlClient client(config.bind_address, config.port, kDefaultTimeoutMs,
+                               kExportMaxReplyBytes);
 
-    const RpcResult response = client.call("export_tasks", nlohmann::json::object());
+    const RpcResult response = client.call(kExportTasksMethod, nlohmann::json::object());
     if (!response.ok())
     {
         reportRpcFailure(response.error());
@@ -795,6 +856,11 @@ constexpr MergeRow kMergeRows[]{
     { "deleted", "deleted_titles", "deleted", "-" },
     { "resurrected", "resurrected_titles", "resurrected", "+" },
     { "skipped", nullptr, "skipped", "" },
+    // Nullptr titles, like "skipped": a repaired stamp belongs to an incoming
+    // RECORD, not to a task, so there is no title to list — and giving this row
+    // a titles key would make the "(N more not listed)" line below claim that N
+    // titles were withheld when no such titles exist.
+    { "stamps_adjusted", nullptr, "stamps repaired (wrong unit on the wire)", "" },
 };
 
 /// Read one counter out of a merge report. nullopt when the document holds no

@@ -1,7 +1,7 @@
 // ControlClient.cpp — blocking client for the daemon's control socket
 //
 // Implements the contract in ControlClient.hpp: one request, one reply, every
-// failure returned as an Error and nothing thrown. The header lists the five
+// failure returned as an Error and nothing thrown. The header lists the six
 // failure modes; this is where each one is produced:
 //
 //   mode                              produced at        error code
@@ -17,6 +17,9 @@
 //                                                        fromRpcErrorCode()
 //   5. malformed reply                steps 5 and 6      kInternal, plus an
 //                                                        excerpt
+//   6. reply over the byte cap        step 4             kInternal, naming the
+//                                                        cap, because the cap
+//                                                        is a caller's choice
 //
 // How a call runs:
 //   1. Serialize the request into one line:
@@ -25,7 +28,9 @@
 //   3. Write the line. asio::async_write loops internally, so a partial write
 //      is not possible here.
 //   4. Read exactly one '\n'-terminated line back; the protocol is one JSON
-//      object per line.
+//      object per line. The line may not exceed the caller's max_reply_bytes,
+//      so a peer that never sends a newline costs a bounded allocation
+//      (mode 6) instead of as much memory as it cares to send.
 //   5. Parse it. Anything unparseable is reported with an excerpt of what
 //      actually arrived, because "the daemon returned garbage" is not
 //      actionable while "the daemon returned <this line>" is.
@@ -101,12 +106,11 @@ constexpr std::int64_t kMinTimeoutMs{ 1 };
 /// first line; the rest is noise.
 constexpr std::size_t kMaxExcerptChars{ 200 };
 
-/// Ceiling on one reply line. The largest legitimate reply (get_queue or
-/// list_tasks over a personal backlog) is tens of kilobytes, so this bounds
-/// nothing real; it exists so a peer that never sends a newline cannot make
-/// the client allocate without limit. read_until reports error::not_found
-/// when the buffer hits it.
-constexpr std::size_t kMaxReplyBytes{ 1024 * 1024 };
+// The reply cap is deliberately NOT a constant here. It is a constructor
+// parameter — see kDefaultMaxReplyBytes in the header for its default value and
+// for why export_tasks is the call that has to raise it — so it travels from
+// the caller through callOnce() into the socket that enforces it. read_until
+// reports error::not_found when the buffer reaches it.
 
 /// The request id sent on every call. Matching replies against it would be
 /// pointless: each call owns its connection, so the only line that can arrive
@@ -161,7 +165,9 @@ std::string replyExcerpt(const std::string &text)
     return text.substr(0, kMaxExcerptChars) + "... (truncated)";
 }
 
-/// One TCP connection whose every step is bounded by a deadline.
+/// One TCP connection whose every step is bounded by a deadline, and whose
+/// reply line is bounded by a byte ceiling — the deadline stops a step that
+/// never finishes, the ceiling stops one that finishes and never stops.
 ///
 /// asio has no synchronous operation that accepts a timeout, so each step
 /// races its asynchronous form against a steady_timer on a private
@@ -194,13 +200,14 @@ class DeadlineSocket
         kFailed,
     };
 
-    explicit DeadlineSocket(std::int64_t timeout_ms)
+    explicit DeadlineSocket(std::int64_t timeout_ms, std::size_t max_reply_bytes)
         : m_io(),
           m_socket(m_io),
           m_resolver(m_io),
           m_timer(m_io),
           m_timeout(std::chrono::milliseconds(
-              static_cast<std::chrono::milliseconds::rep>(timeout_ms)))
+              static_cast<std::chrono::milliseconds::rep>(timeout_ms))),
+          m_maxReplyBytes(max_reply_bytes)
     {
     }
 
@@ -264,15 +271,15 @@ class DeadlineSocket
     }
 
     /// Read up to and including the first '\n' into `out` (which is cleared
-    /// first). A buffer that fills without a newline fails with
-    /// error::not_found; a peer that closes first fails with eof or a reset —
-    /// in both cases `out` still holds whatever did arrive, which is the only
-    /// diagnostic available.
+    /// first). A buffer that fills to m_maxReplyBytes without a newline fails
+    /// with error::not_found; a peer that closes first fails with eof or a
+    /// reset — in both cases `out` still holds whatever did arrive, which is
+    /// the only diagnostic available.
     [[nodiscard]] Outcome readLine(std::string &out)
     {
         out.clear();
         return run([this, &out]() {
-            asio::async_read_until(m_socket, asio::dynamic_buffer(out, kMaxReplyBytes), '\n',
+            asio::async_read_until(m_socket, asio::dynamic_buffer(out, m_maxReplyBytes), '\n',
                                    [this](const std::error_code &read_ec, std::size_t) {
                                        m_ec = read_ec;
                                        m_timer.cancel();
@@ -343,6 +350,7 @@ class DeadlineSocket
     asio::ip::tcp::resolver m_resolver;
     asio::steady_timer m_timer;
     std::chrono::milliseconds m_timeout;
+    std::size_t m_maxReplyBytes;
     asio::ip::tcp::resolver::results_type m_endpoints;
     std::error_code m_ec;
     bool m_timedOut{ false };
@@ -418,8 +426,8 @@ namespace
 /// parser, asio's io_context::run()) and the class contract is that no
 /// exception ever leaves a public method.
 [[nodiscard]] RpcResult callOnce(const std::string &host, std::uint16_t port,
-                                 std::int64_t timeout_ms, const std::string &method,
-                                 const nlohmann::json &params)
+                                 std::int64_t timeout_ms, std::size_t max_reply_bytes,
+                                 const std::string &method, const nlohmann::json &params)
 {
     // --- 1. Serialize -----------------------------------------------------
     // nlohmann refuses to dump a string that is not valid UTF-8 (a task title
@@ -444,7 +452,7 @@ namespace
     }
 
     const std::string address = addressText(host, port);
-    DeadlineSocket connection(timeout_ms);
+    DeadlineSocket connection(timeout_ms, max_reply_bytes);
 
     // --- 2. Connect -------------------------------------------------------
     // The most common failure, and the only one with a one-command fix, so it
@@ -491,11 +499,13 @@ namespace
     {
         // A full buffer means the peer never sent a newline; anything else
         // means it closed on us. Both are diagnosed by the same thing — what
-        // actually arrived — which read_until leaves in `line`.
+        // actually arrived — which read_until leaves in `line`. The cap is
+        // named in bytes rather than described, because the number is what a
+        // caller whose reply legitimately needs more has to pass back in.
         if (asio::error::not_found == connection.error())
         {
             return Error::internal("the reply to '" + method + "' from " + address +
-                                   " exceeded " + std::to_string(kMaxReplyBytes) +
+                                   " exceeded " + std::to_string(max_reply_bytes) +
                                    " bytes without a newline; giving up");
         }
         return Error::internal("the daemon at " + address +
@@ -590,11 +600,19 @@ namespace
 
 } // namespace
 
-ControlClient::ControlClient(std::string host, std::uint16_t port, std::int64_t timeout_ms)
+ControlClient::ControlClient(std::string host, std::uint16_t port, std::int64_t timeout_ms,
+                             std::size_t max_reply_bytes)
     : m_host(std::move(host)),
       m_port(port),
-      m_timeoutMs(timeout_ms > 0 ? timeout_ms : kMinTimeoutMs)
+      m_timeoutMs(timeout_ms > 0 ? timeout_ms : kMinTimeoutMs),
+      m_maxReplyBytes(max_reply_bytes)
 {
+    // The reply cap is stored exactly as given, with no floor of its own: it is
+    // the caller's ceiling rather than a deadline, so a caller that passes a
+    // small one gets a call that fails with the bound named in the message
+    // (mode 6), not a larger one substituted behind its back. Only the timeout
+    // is clamped, and only because a zero there would fail every call for a
+    // reason that looks like a network fault.
 }
 
 RpcResult ControlClient::call(const std::string &method, const nlohmann::json &params) const
@@ -606,7 +624,7 @@ RpcResult ControlClient::call(const std::string &method, const nlohmann::json &p
     // host process down with an escaping exception.
     try
     {
-        return callOnce(m_host, m_port, m_timeoutMs, method, params);
+        return callOnce(m_host, m_port, m_timeoutMs, m_maxReplyBytes, method, params);
     }
     catch (const std::exception &exception)
     {
@@ -632,7 +650,10 @@ bool ControlClient::ping() const
     // real call() produces a message that names the address and the fix.
     try
     {
-        DeadlineSocket connection(m_timeoutMs);
+        // The cap is passed along even though this probe reads nothing: the
+        // socket type owns both bounds, and a second construction path that
+        // omitted one would be a place for the two to drift.
+        DeadlineSocket connection(m_timeoutMs, m_maxReplyBytes);
         return DeadlineSocket::Outcome::kOk == connection.connect(m_host, m_port);
     }
     catch (...)

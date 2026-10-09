@@ -48,10 +48,16 @@ on it, which is the bug the uuid exists to prevent.
 
 **Cross-machine sync**: the backlog travels as a JSONL export — one record per
 line, sorted by uid, deletions kept as tombstones — committed to a separate
-**private** data repository (`taskPilot-data`), and merged back in with
-last-write-wins over the record's stamp. `TaskSync` holds the format and the
-complete decision table as pure code (no database, no clock); `TaskStore`
-applies it inside one transaction. The specification is `docs/sync.md`.
+**private** data repository (`taskPilot-data`), at `export/tasks.jsonl`, and
+merged back in with last-write-wins over the record's stamp. A merge **adopts** a
+tombstone for a uid this machine never held: skipping it would drop that line
+from this machine's own export, and a machine that still had the task live would
+then learn nothing from the file and republish the deleted task. Stamps are
+epoch **seconds**, and an implausible one (milliseconds, say) is refused at
+parse rather than allowed to win every merge forever. `TaskSync` holds the
+format and the complete decision table as pure code (no database, no clock);
+`TaskStore` applies it inside one transaction. The specification is
+`docs/sync.md`.
 
 ---
 
@@ -92,7 +98,7 @@ Environment variables:
 |---|---|
 | `TASKPILOT_DB` | Database path. `run.sh` exports `<repo>/data/taskpilot.db` unless it is already set. |
 | `TASKPILOT_PORT` | Control socket port, read by the binary. Default `8091`. |
-| `TASKPILOT_BIND` | Bind address for `serve` (connect address for `mcp` and `cli`). Default `127.0.0.1`. |
+| `TASKPILOT_BIND` | Bind address for `serve` (connect address for `mcp`, `cli`, `export` and `import`). Default `127.0.0.1`. |
 | `TASKPILOT_BUILD_DIR` | Directory `run.sh` builds into. Default `build`. Read by the script only, never by the binary. |
 
 Precedence for the first three, lowest to highest: built-in default, then the
@@ -122,13 +128,14 @@ has to create it.
 naming the address when the port is already taken, which is the normal way a
 second `serve` announces that one is already running. Only the port is locked: a
 second daemon on another port would happily open the same database file, so give
-it its own `--db` if you ever run two. `mcp` and `cli` are clients and must never
-open the store themselves — if either one wrote to SQLite directly, the daemon's
-view and the file would drift with no reconciliation.
+it its own `--db` if you ever run two. `mcp`, `cli`, `export` and `import` are
+CLIENTS and must never open the store themselves — if one of them wrote to
+SQLite directly, the daemon's view and the file would drift with no
+reconciliation.
 
-**Both clients are stateless.** They open a connection per call and hold
-nothing. If the daemon restarts, the next call reconnects; there is no recovery
-logic to get wrong.
+**The client subcommands are stateless.** They open a connection per call and
+hold nothing. If the daemon restarts, the next call reconnects; there is no
+recovery logic to get wrong.
 
 ---
 
@@ -332,8 +339,10 @@ When adding a capability, ask which layer owns it:
    engine's job, and a storage-level sort would silently disagree with the
    documented tie-breakers.
 7. **Don't break the total order.** `PriorityEngine::rank` ties break on
-   `created_at` then `id` so the queue is reproducible. A comparator that
-   depends on input order is a bug even when it looks stable in practice.
+   `created_at` then `uid` so the queue is reproducible — and, because `uid` is
+   the one key both machines share, the same order everywhere (see the identity
+   rule above; the local `id` is deliberately never the final key). A comparator
+   that depends on input order is a bug even when it looks stable in practice.
 8. **Don't bind anywhere but loopback.** See below.
 9. **Don't throw for an expected failure.** Not-found, invalid input, and I/O
    faults are `Error` values; a throw across the RPC boundary would be an
@@ -366,7 +375,7 @@ should stay that way. It is personal backlog content, not source.
 | `docs/architecture.md` | Layers, process model, the data flow of one tool call, threading, schema. |
 | `docs/mcp.md` | The MCP contract: both protocol eras, version lists, error codes, tools. |
 | `docs/scoring.md` | **The scoring specification.** If the code and this document disagree, the code is wrong. |
-| `docs/sync.md` | **The cross-machine sync specification.** The JSONL record format, the four properties that make the file mergeable, the merge decision table and its two asymmetries, tombstones, and the two-machine workflow. |
+| `docs/sync.md` | **The cross-machine sync specification.** The JSONL record format, stamp integrity (epoch seconds, checked at parse), the four properties that make the file mergeable, the twelve-row merge decision table and its three asymmetries, tombstones (including the adoption rule), the deterministic uid backfill, and the two-machine workflow. |
 
 When you change behaviour, update the document that describes it in the same
 commit. `docs/scoring.md` is the one document that is a specification rather than

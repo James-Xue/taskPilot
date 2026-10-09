@@ -46,6 +46,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -227,6 +228,57 @@ constexpr int kMinBlocks{ 0 };
     const auto since_epoch = std::chrono::system_clock::now().time_since_epoch();
     const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(since_epoch);
     return static_cast<std::int64_t>(seconds.count());
+}
+
+/// The stamp a LOCAL write must give a row whose current stamp is `existing`.
+///
+/// A row's stamp is not always this machine's clock: a merge stores the
+/// exporting machine's stamp verbatim (insertSyncedTask, updateSyncedTask), so
+/// a peer whose clock runs ahead — a fast clock, a laptop resumed from suspend,
+/// a VM restored from a snapshot — leaves the row carrying a stamp that is in
+/// the future measured against our own clock. Stamping such a row with plain
+/// nowEpochSeconds() therefore moves its stamp BACKWARDS, and both consequences
+/// are user-visible rather than theoretical:
+///
+/// 1. The next merge compares the row's new, smaller stamp against the peer's
+///    copy of the old, larger one, concludes the peer is newer and overwrites
+///    the edit that had just been reported as saved. The user watches their own
+///    change disappear, on the machine they made it on.
+/// 2. Until that merge runs, this machine's export advertises an older stamp
+///    than the record it was derived from, so every other machine reads a
+///    version of the task that was already superseded here.
+///
+/// So the write is floored at `existing + 1`: strictly newer than what the row
+/// already carried, which is the only property last-write-wins needs in order
+/// to keep treating this edit as the latest write.
+///
+/// The saturation at INT64_MAX is unreachable in practice — parseJsonLine
+/// rejects a transported stamp more than a year ahead, and that ceiling moves
+/// at the same speed as the clock, so `existing` cannot approach it — and is
+/// here only so a hand-mangled cell cannot make this addition overflow into a
+/// negative stamp, which would lose every merge instead of winning every one.
+[[nodiscard]] std::int64_t stampAfterExisting(std::int64_t existing, std::int64_t now)
+{
+    // 1. The floor: one past what the row carried, or the ceiling itself in the
+    //    degenerate case where the row already sits on it. This is what keeps a
+    //    local edit from being written with a stamp LOWER than the row already
+    //    had, which would make the next merge discard it as "older" and revert
+    //    the user's own edit — the failure this floor exists to prevent.
+    //
+    //    It does mean the stamp creeps 1 second per write while the row sits
+    //    ahead of the local clock (a peer whose clock runs fast). That is
+    //    harmless and deliberately not capped: the plausibility window is now
+    //    ABSOLUTE (kMaxPlausibleStamp, year 2100), so walking a stamp forward
+    //    would need tens of millions of edits to matter — whereas capping the
+    //    floor to `now` beyond some skew reintroduces the reverted-edit bug for
+    //    every row a fast peer has ever touched. The two failure modes are not
+    //    comparable, so the floor wins.
+    const std::int64_t floor = (std::numeric_limits<std::int64_t>::max() > existing) ?
+                                   existing + 1 :
+                                   std::numeric_limits<std::int64_t>::max();
+    // 2. A machine with a sane clock is already past the floor, and keeps its
+    //    ordinary stamp: this is a floor, not a substitution.
+    return (floor > now) ? floor : now;
 }
 
 /// Read a TEXT column as a std::string.
@@ -669,6 +721,23 @@ struct BoundValue
     Task task;
     task.id = sqlite3_column_int64(stmt, kColId);
     task.uid = textColumn(stmt, kColUid);
+
+    // Normalise to lowercase on the way out. The parser accepts lowercase only
+    // (see Uuid.hpp for why case is a correctness rule here), but a row stored by
+    // an earlier build — whose check was case-insensitive — can hold an
+    // upper-cased uid. Such a row was emitted verbatim by the export and then
+    // refused by the SAME machine's own export self-check, so export_tasks failed
+    // for the entire backlog and no API could repair it: importing the correct
+    // spelling for that uid inserted a DUPLICATE task, because the store matches
+    // uids as strings. Normalising on read makes the stored spelling irrelevant.
+    // The generator only ever emits lowercase, so a correct row is unchanged.
+    for (char &c : task.uid)
+    {
+        if ('A' <= c && 'Z' >= c)
+        {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
     task.title = textColumn(stmt, kColTitle);
     task.notes = textColumn(stmt, kColNotes);
 
@@ -764,13 +833,6 @@ struct BoundValue
                                  sqlite3_errmsg(db));
 }
 
-/// Everything the local store knows about one uid, as decide() wants it.
-struct LocalLookup
-{
-    LocalState state;
-    Task task; ///< The live row when state.present; default-constructed otherwise.
-};
-
 /// Read the local side of one uid: the live row and/or its tombstone.
 ///
 /// Both tables are consulted because the decision table distinguishes "never
@@ -783,18 +845,25 @@ struct LocalLookup
 /// reachable by editing the database by hand, since no path here produces it —
 /// the live row owns the stamp: it is the state the merge is reconciling, and
 /// the branch decide() will take for it is the live-row one.
-[[nodiscard]] Result<LocalLookup> lookupLocal(sqlite3 *db, const std::string &uid)
+///
+/// The live row itself goes into state.task rather than staying a second value
+/// beside it. decide() needs it: two records with the same stamp are broken by
+/// CONTENT, and decide() is a pure function with no database of its own to read
+/// the local side from (LocalState::task). One copy of the row keeps the stamp
+/// and the content the merge compares from ever disagreeing — and it costs a
+/// copy, not a query, because the row was read here for its stamp anyway.
+[[nodiscard]] Result<LocalState> lookupLocal(sqlite3 *db, const std::string &uid)
 {
-    LocalLookup lookup;
+    LocalState state;
 
     // 1. The live row, if any. Finding nothing is the normal case for an
     //    unknown uid, not a failure, so absence leaves `present` false instead
     //    of becoming an error.
     const Result<Task> live = selectTaskByUid(db, uid);
     if (live.ok()) {
-        lookup.task = live.value();
-        lookup.state.present = true;
-        lookup.state.stamp = lookup.task.updated_at;
+        state.task = live.value();
+        state.present = true;
+        state.stamp = state.task.updated_at;
     } else if (ErrorCode::kNotFound != live.error().code) {
         // Only absence is expected here; a failed SELECT must not be read as
         // "the task is not there", which would turn a broken query into an
@@ -814,17 +883,17 @@ struct LocalLookup
     }
     const int result = sqlite3_step(stmt.handle());
     if (SQLITE_ROW == result) {
-        lookup.state.tombstoned = true;
-        if (!lookup.state.present) {
+        state.tombstoned = true;
+        if (!state.present) {
             // deleted_at is NOT NULL, so a row always carries a usable stamp.
-            lookup.state.stamp = sqlite3_column_int64(stmt.handle(), 0);
+            state.stamp = sqlite3_column_int64(stmt.handle(), 0);
         }
     } else if (SQLITE_DONE != result) {
         return Error::storageFailure("failed to read the tombstone for uid " + uid + ": " +
                                      sqlite3_errmsg(db));
     }
 
-    return lookup;
+    return state;
 }
 
 /// The one validation every write path shares.
@@ -971,6 +1040,40 @@ struct LocalLookup
     return stepDone(stmt, "update a merged task");
 }
 
+/// Write the tombstone for `uid` at `deleted_at`.
+///
+/// Every path that has to leave a deletion behind goes through here: the local
+/// deleteTask, the merge's kDelete (which also removes the live row first), and
+/// the merge's kRecordTombstone / kReviseTombstone, where the deletion happened
+/// on another machine and this one was not there to see it. One writer means
+/// one statement to reason about when the question is "what does this store
+/// claim was deleted, and when".
+///
+/// INSERT OR REPLACE rather than INSERT, twice over:
+/// 1. A uid can be deleted more than once across a delete/resurrect cycle, and
+///    the newest stamp is the one the next merge has to compare against.
+/// 2. uid is the PRIMARY KEY, so a replace keeps exactly ONE row per uid —
+///    which is what keeps the export at one line per uid (TaskSync.hpp,
+///    property 3) instead of accumulating a second, contradictory line.
+[[nodiscard]] Status recordTombstone(sqlite3 *db, const std::string &uid, std::int64_t deleted_at)
+{
+    Statement remember;
+    const Status prepared =
+        remember.prepare(db, "INSERT OR REPLACE INTO tombstones(uid, deleted_at) VALUES(?, ?)");
+    if (!prepared.ok()) {
+        return prepared.error();
+    }
+    const Status bound_uid = bindText(remember, 1, uid);
+    if (!bound_uid.ok()) {
+        return bound_uid.error();
+    }
+    const Status bound_stamp = bindInt64(remember, 2, deleted_at);
+    if (!bound_stamp.ok()) {
+        return bound_stamp.error();
+    }
+    return stepDone(remember, "record a deletion");
+}
+
 /// Remove the live row for `uid` (if any) and record the deletion.
 ///
 /// Shared by deleteTask and the merge's kDelete, because both have to leave the
@@ -979,10 +1082,6 @@ struct LocalLookup
 /// deleted here and re-inserted by the next merge from the other machine — the
 /// resurrection tombstones exist to prevent, and the reason the two statements
 /// belong in one transaction (see deleteTask).
-///
-/// INSERT OR REPLACE rather than INSERT: a uid can be deleted more than once
-/// across a delete/resurrect cycle, and the newest stamp is the one the next
-/// merge has to compare against.
 [[nodiscard]] Status removeTaskByUid(sqlite3 *db, const std::string &uid, std::int64_t deleted_at)
 {
     Statement remove;
@@ -1007,21 +1106,7 @@ struct LocalLookup
         return Error::notFound("no live task with uid " + uid);
     }
 
-    Statement remember;
-    const Status prepared_remember =
-        remember.prepare(db, "INSERT OR REPLACE INTO tombstones(uid, deleted_at) VALUES(?, ?)");
-    if (!prepared_remember.ok()) {
-        return prepared_remember.error();
-    }
-    const Status bound_uid = bindText(remember, 1, uid);
-    if (!bound_uid.ok()) {
-        return bound_uid.error();
-    }
-    const Status bound_stamp = bindInt64(remember, 2, deleted_at);
-    if (!bound_stamp.ok()) {
-        return bound_stamp.error();
-    }
-    return stepDone(remember, "record a deletion");
+    return recordTombstone(db, uid, deleted_at);
 }
 
 /// Append one example title to a report list, honoring the cap.
@@ -1053,14 +1138,23 @@ void rememberTitle(std::vector<std::string> &titles, const std::string &title)
                                        MergeReport &report)
 {
     for (const SyncRecord &record : records) {
-        const Result<LocalLookup> local = lookupLocal(db, record.uid);
+        const Result<LocalState> local = lookupLocal(db, record.uid);
         if (!local.ok()) {
             return local.error();
         }
 
         // No default: label, so a new SyncAction is a build failure here rather
         // than a record silently doing nothing.
-        switch (decide(local.value().state, record)) {
+        // Counted before the decision, because a repaired stamp is a property of
+        // the incoming RECORD and not of what the merge chose to do with it: a
+        // record that is ultimately skipped as older was still malformed, and a
+        // caller needs to see that the peer is sending the wrong unit.
+        if (record.stamp_adjusted)
+        {
+            ++report.stamps_adjusted;
+        }
+
+        switch (decide(local.value(), record)) {
         case SyncAction::kInsert: {
             const Status inserted = insertSyncedTask(db, record);
             if (!inserted.ok()) {
@@ -1113,6 +1207,52 @@ void rememberTitle(std::vector<std::string> &titles, const std::string &title)
             rememberTitle(report.resurrected_titles, record.task.title);
             break;
         }
+        case SyncAction::kRecordTombstone: {
+            // Adopt a deletion for a uid this store has never held. Skipping it
+            // is the one shortcut here that destroys the record rather than
+            // merely mis-stamping it, and the loss is invisible from this
+            // machine, which is what makes it worth spelling out:
+            //   1. A machine that skips the tombstone stores nothing.
+            //   2. exportJsonl writes only what the store holds, so this
+            //      machine's export omits the uid's line entirely.
+            //   3. A file with no line for a uid is indistinguishable from a
+            //      file where the task was never deleted, and git propagates
+            //      the omission as a deletion of the tombstone.
+            //   4. Every machine still holding the task live learns nothing
+            //      from that file, keeps the task, and republishes it live —
+            //      so the deleted task comes back everywhere while the machine
+            //      that caused it reports "skipped: 1, clean".
+            // Storing it costs one row and makes the file's account of this uid
+            // complete, which is the whole basis of merging per uid.
+            const Status recorded = recordTombstone(db, record.uid, record.stamp);
+            if (!recorded.ok()) {
+                return recorded.error();
+            }
+            // Counted as an insertion: the uid is new to this store's state,
+            // and the counts are what a caller reads to tell a sync that
+            // changed something from one that changed nothing (MergeReport has
+            // no counter of its own for an adopted tombstone). No example title
+            // is remembered, because a tombstone record carries no title to
+            // show a dry-run reviewer — these two actions are counted, not
+            // listed.
+            ++report.inserted;
+            break;
+        }
+        case SyncAction::kReviseTombstone: {
+            // Both machines deleted the same task at their own second. The
+            // stamps have to be revised to ONE of them or the two exports
+            // differ on this line forever and git conflicts on it at every
+            // sync — the two machines would never converge. decide() picks the
+            // newer stamp, deterministically on both sides, so adopting it here
+            // is what makes the pair agree. Counted as an update for the same
+            // reason the branch above is an insertion.
+            const Status revised = recordTombstone(db, record.uid, record.stamp);
+            if (!revised.ok()) {
+                return revised.error();
+            }
+            ++report.updated;
+            break;
+        }
         case SyncAction::kSkip:
             ++report.skipped;
             break;
@@ -1157,6 +1297,109 @@ void rememberTitle(std::vector<std::string> &titles, const std::string &title)
     return false;
 }
 
+/// Offsets in the migration's own SELECT (kMigrationColumns). Local to the
+/// migration rather than a reuse of the kCol* list above: that one is the shape
+/// readTaskRow materializes into a Task, while this query deliberately reads
+/// RAW cells — see canonicalCell.
+constexpr int kMigrationColId = 0;
+constexpr int kMigrationColTitle = 1;
+constexpr int kMigrationColNotes = 2;
+constexpr int kMigrationColStatus = 3;
+constexpr int kMigrationColImportance = 4;
+constexpr int kMigrationColDueAt = 5;
+constexpr int kMigrationColBlocks = 6;
+constexpr int kMigrationColTags = 7;
+constexpr int kMigrationColCreatedAt = 8;
+constexpr int kMigrationColCompletedAt = 9;
+
+/// The columns the uid backfill canonicalizes, in the order the offsets above
+/// name them.
+constexpr const char *kMigrationColumns =
+    "id, title, notes, status, importance, due_at, blocks, tags, created_at, completed_at";
+
+/// One nullable INTEGER cell, rendered for the canonical text a derived uid
+/// comes from.
+///
+/// What is canonicalized is the RAW storage, not the value readTaskRow would
+/// produce, because the derivation has to be a function of the file the two
+/// machines hold: a copied database or a restored backup matches cell for cell,
+/// while a cell that is corrupt degrades to "no timestamp" when read. Two rows
+/// differing only in such a cell would then canonicalize identically, so the
+/// storage class is tagged and non-integer text is echoed (sqlite renders REAL
+/// and BLOB as text on request, the same way optionalInt64Column's warning
+/// does).
+[[nodiscard]] nlohmann::json canonicalCell(sqlite3_stmt *stmt, int index)
+{
+    const int storage_class = sqlite3_column_type(stmt, index);
+    if (SQLITE_NULL == storage_class) {
+        return nlohmann::json{ { "kind", "null" } };
+    }
+    if (SQLITE_INTEGER == storage_class) {
+        return nlohmann::json{
+            { "kind", "integer" },
+            { "value", static_cast<std::int64_t>(sqlite3_column_int64(stmt, index)) },
+        };
+    }
+    return nlohmann::json{ { "kind", "text" }, { "value", textColumn(stmt, index) } };
+}
+
+/// The canonical text one row's backfilled uid is derived from.
+///
+/// Built as a JSON object for two properties the derivation cannot do without
+/// and a hand-rolled concatenation would have only by luck:
+///   1. The serializer owns the field boundaries and the escaping, so a title
+///      containing a separator character cannot make two different rows
+///      canonicalize to one string — which would hand two tasks one identity,
+///      the fork the uid exists to prevent.
+///   2. Key order is the object's own, not the order written here, so
+///      reformatting this function cannot silently change every uid in the
+///      field.
+///
+/// The local id and created_at are included on purpose, as Uuid.hpp advises: a
+/// copied database preserves both, so two copies of one row canonicalize
+/// identically, while two tasks created independently do not — which is what
+/// stops a genuine second task from being mistaken for the first.
+///
+/// `updated_at` is deliberately NOT included even though it is a column of the
+/// row. It is the merge stamp and it moves on every touch, so two machines
+/// holding one task with identical content but different stamps (one copy was
+/// touched after the copy, before either entered the sync era) would derive
+/// different uids for the same task — re-creating the duplication this function
+/// exists to prevent.
+///
+/// Residual case, stated plainly: two rows whose canonical fields agree in
+/// every particular — content, created_at and local id — derive the same uid and
+/// merge into one task rather than being duplicated. Rows that agree on all of
+/// that are indistinguishable to a merge anyway, so the outcome is a merge, not
+/// a corruption. Inside ONE database the case cannot arise: the local id is the
+/// primary key, so the canonical forms are distinct by construction and the
+/// unique index created below can never be handed a duplicate.
+[[nodiscard]] std::string canonicalRowText(sqlite3_stmt *stmt)
+{
+    nlohmann::json canonical;
+    canonical["id"] = static_cast<std::int64_t>(sqlite3_column_int64(stmt, kMigrationColId));
+    canonical["title"] = textColumn(stmt, kMigrationColTitle);
+    canonical["notes"] = textColumn(stmt, kMigrationColNotes);
+    canonical["status"] = textColumn(stmt, kMigrationColStatus);
+    canonical["importance"] = static_cast<std::int64_t>(sqlite3_column_int(stmt, kMigrationColImportance));
+    canonical["due_at"] = canonicalCell(stmt, kMigrationColDueAt);
+    canonical["blocks"] = static_cast<std::int64_t>(sqlite3_column_int(stmt, kMigrationColBlocks));
+    canonical["tags"] = textColumn(stmt, kMigrationColTags);
+    canonical["created_at"] = static_cast<std::int64_t>(sqlite3_column_int64(stmt, kMigrationColCreatedAt));
+    canonical["completed_at"] = canonicalCell(stmt, kMigrationColCompletedAt);
+    // error_handler_t::replace, NOT the default strict handler. A legacy row can
+    // hold a byte that is not valid UTF-8 (a GBK or Latin-1 paste, a BLOB written
+    // by a script, a foreign dump restored into the database), and strict
+    // serialization THROWS on it — from inside the migration, on the open() path,
+    // where nothing catches it, so the daemon died with SIGABRT and no
+    // diagnostic every time it started. Replacing the byte keeps the migration
+    // running and the uid is still deterministic (the same row on two machines
+    // yields the same bytes, hence the same uid), which is the property the
+    // backfill exists for. Task.cpp's serializeTags already takes the same
+    // precaution for the same reason.
+    return canonical.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
 /// Bring a database up to schema version 1: `tasks.uid`, its unique index, and
 /// the tombstones table (the last of which the schema statements already
 /// created, since it depends on nothing).
@@ -1169,10 +1412,16 @@ void rememberTitle(std::vector<std::string> &titles, const std::string &title)
 ///    a UNIQUE column"), and which would be the wrong tool anyway: every
 ///    existing row starts out NULL.
 /// 2. Backfill every row that still has no usable uid (NULL, or the empty
-///    string a hand-written INSERT would leave). One fresh v4 uuid per row —
-///    shared or sequential values would re-create exactly the collision the
-///    uid exists to prevent, since the point is that two machines can generate
-///    identities independently without coordination.
+///    string a hand-written INSERT would leave). The value is DERIVED from the
+///    row's canonical text (canonicalRowText), never generated, and that choice
+///    is the difference between a first sync and a duplicated backlog: two
+///    machines that entered the sync era holding the SAME rows — one database
+///    copied to the other, a restored backup, an rsync — must derive the SAME
+///    uid for the same row. A random value per row and per machine gives each
+///    side an identity the other has never seen, so every row arrives as new
+///    and the merge inserts a second copy of the whole backlog. Uuid.hpp owns
+///    the reasoning; what matters here is that the canonical form is a function
+///    of the row AS STORED, so two copies of one file derive identical values.
 /// 3. Only THEN create the unique index. Creating it first is what looks
 ///    harmless and is not: a database whose uid cells hold the SAME text — a
 ///    partially hand-migrated one where several rows say '', which is a value
@@ -1208,22 +1457,36 @@ void rememberTitle(std::vector<std::string> &titles, const std::string &title)
         }
     }
 
-    // Collect the ids first, then update: running an UPDATE while a SELECT over
+    // Collect the rows first, then update: running an UPDATE while a SELECT over
     // the same table is mid-iteration would ask SQLite to rewrite the rows the
     // cursor is walking. The set is small (it shrinks to empty after the first
     // migration), and the update only ever touches rows the SELECT already
     // returned, so there is no risk of missing a row this way.
-    std::vector<std::int64_t> unassigned;
+    //
+    // The canonical text is built here, while the row is in hand, rather than in
+    // the write pass below: that pass has only an id, and re-reading the row to
+    // canonicalize it would ask sqlite for the very columns already in the
+    // cursor.
+    struct UnassignedRow
+    {
+        std::int64_t id{ 0 };
+        std::string canonical;
+    };
+    std::vector<UnassignedRow> unassigned;
     {
         Statement select;
         const Status prepared =
-            select.prepare(db, "SELECT id FROM tasks WHERE uid IS NULL OR uid = ''");
+            select.prepare(db, std::string("SELECT ") + kMigrationColumns +
+                                   " FROM tasks WHERE uid IS NULL OR uid = ''");
         if (!prepared.ok()) {
             return prepared.error();
         }
         int result = sqlite3_step(select.handle());
         while (SQLITE_ROW == result) {
-            unassigned.push_back(sqlite3_column_int64(select.handle(), 0));
+            UnassignedRow row;
+            row.id = static_cast<std::int64_t>(sqlite3_column_int64(select.handle(), kMigrationColId));
+            row.canonical = canonicalRowText(select.handle());
+            unassigned.push_back(std::move(row));
             result = sqlite3_step(select.handle());
         }
         if (SQLITE_DONE != result) {
@@ -1238,19 +1501,19 @@ void rememberTitle(std::vector<std::string> &titles, const std::string &title)
         if (!prepared.ok()) {
             return prepared.error();
         }
-        for (const std::int64_t id : unassigned) {
-            // A failure here fails open() loudly: a row that cannot be given an
-            // identity cannot be exported or merged safely, and Uuid.hpp argues
-            // against any fallback that might silently repeat a value.
-            const Result<std::string> generated = generateUuidV4();
-            if (!generated.ok()) {
-                return generated.error();
-            }
-            const Status bound_uid = bindText(update, 1, generated.value());
+        for (const UnassignedRow &row : unassigned) {
+            // The derivation is a pure function of the canonical text, so it
+            // cannot fail; what can fail is the write below, and it fails
+            // open() loudly rather than falling back to a guess. A row that
+            // cannot be given an identity cannot be exported or merged safely,
+            // and Uuid.hpp argues against any fallback that might silently
+            // repeat a value.
+            const std::string uid = deriveUuidFromText(row.canonical);
+            const Status bound_uid = bindText(update, 1, uid);
             if (!bound_uid.ok()) {
                 return bound_uid.error();
             }
-            const Status bound_id = bindInt64(update, 2, id);
+            const Status bound_id = bindInt64(update, 2, row.id);
             if (!bound_id.ok()) {
                 return bound_id.error();
             }
@@ -1417,7 +1680,10 @@ Result<Task> TaskStore::addTask(Task draft)
 
     // Sampled once so created_at and updated_at agree exactly on a new row —
     // a task that is already "modified" the instant it is created would be a
-    // lie a client can observe.
+    // lie a client can observe. No floor against an earlier stamp is needed
+    // here, unlike updateTask: this row did not exist a moment ago and its uid
+    // was minted with it, so there is no earlier stamp it could move backwards
+    // (stampAfterExisting covers the rows that do have one).
     const std::int64_t now = nowEpochSeconds();
 
     // Whatever the caller put in id/uid/created_at/updated_at/completed_at is
@@ -1613,6 +1879,14 @@ Result<Task> TaskStore::updateTask(std::int64_t id, const TaskPatch &patch)
         after.completed_at = std::nullopt;
     }
 
+    // The stamp this write carries, floored against the one the row arrived
+    // with so a local edit can never move updated_at backwards (the failure
+    // that causes is stampAfterExisting's subject). completed_at above is
+    // deliberately not floored: it records when THIS machine observed the
+    // completion rather than what any merge will compare, so there is nothing
+    // for it to stay ahead of.
+    const std::int64_t stamp = stampAfterExisting(before.updated_at, now);
+
     const Status valid = validateTaskFields(after.title, after.importance, after.blocks, after.tags);
     if (!valid.ok()) {
         return valid.error();
@@ -1658,9 +1932,9 @@ Result<Task> TaskStore::updateTask(std::int64_t id, const TaskPatch &patch)
     }
     // updated_at is refreshed even by a patch that changes nothing: the column
     // means "last touched", and a no-op write is still a touch the client
-    // asked for.
+    // asked for. Never to a value older than the row's: see `stamp` above.
     assignments.emplace_back("updated_at = ?");
-    values.push_back(int64Value(now));
+    values.push_back(int64Value(stamp));
 
     std::string sql = "UPDATE tasks SET ";
     for (std::size_t index = 0; index < assignments.size(); ++index) {
@@ -1717,9 +1991,25 @@ Status TaskStore::deleteTask(std::int64_t id)
         return began.error();
     }
 
-    // nowEpochSeconds() is sampled after the row was read, so on this machine's
-    // clock the tombstone is at least as new as anything the row carried.
-    const Status removed = removeTaskByUid(m_db, doomed.value().uid, nowEpochSeconds());
+    // The tombstone is stamped against the ROW, not against the clock alone,
+    // and the distinction is the difference between a deletion that travels and
+    // one that does not.
+    //
+    // Sampling nowEpochSeconds() after the row was read only makes the
+    // tombstone at least as new as anything the row carried when that stamp
+    // came from THIS machine's clock. In a synced backlog it normally did not:
+    // a merge stores the exporting machine's stamp verbatim, so deleting a task
+    // last edited on a peer whose clock runs ahead gives a tombstone that is
+    // BORN LOSING. A tombstone wins only a tie or better (`stamp >=`, the
+    // delete-wins-a-tie asymmetry in TaskSync.hpp), so an older stamp is
+    // skipped by every merge: the deletion never leaves this machine, and the
+    // peer keeps exporting the live task — which this machine then resurrects
+    // from its own tombstone. Floored here, the tombstone is strictly newer
+    // than the row it removes, which is what makes the deletion the latest
+    // write rather than an echo of an older one.
+    const Status removed = removeTaskByUid(
+        m_db, doomed.value().uid,
+        stampAfterExisting(doomed.value().updated_at, nowEpochSeconds()));
     if (!removed.ok()) {
         // Any early return here rolls the transaction back in ~Transaction, so
         // the row and the tombstone are both still there (or both still gone).
@@ -2156,6 +2446,7 @@ nlohmann::json toJson(const MergeReport &report)
         { "deleted", report.deleted },
         { "resurrected", report.resurrected },
         { "skipped", report.skipped },
+        { "stamps_adjusted", report.stamps_adjusted },
         { "inserted_titles", report.inserted_titles },
         { "updated_titles", report.updated_titles },
         { "deleted_titles", report.deleted_titles },

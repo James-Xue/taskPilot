@@ -1,4 +1,5 @@
-// tests/unit/test_uuid.cpp — uuid generation and the shape check
+// tests/unit/test_uuid.cpp — uuid generation, text-derived uuids, and the shape
+// check
 //
 // The generator and the checker face different accidents, so they are tested
 // against different things:
@@ -18,8 +19,17 @@
 //     version nibble typed as 1 instead of 4.
 //
 // Text case is a deliberate decision rather than an accident: the generator
-// emits lowercase and the checker ACCEPTS both spellings. The reasoning, and
-// what it costs, are in UuidShapeTest.UppercaseHexIsAccepted below.
+// emits lowercase and the checker ACCEPTS LOWERCASE ONLY, because every merge
+// comparison keys on the uid string and two spellings are two identities. The
+// reasoning, and what it costs, are in UuidShapeTest.UppercaseHexIsRejected
+// below — a deliberate reversal of what this file used to assert.
+//
+// deriveUuidFromText faces a third accident: two machines that hold the same
+// rows must derive the SAME uid for them, or the first sync duplicates every
+// task. Its tests are therefore about determinism and reach rather than about
+// randomness — the same canonical text always yields the same uuid, similar
+// texts do not collide, and the result passes the checker the rest of the
+// system gates on (UuidDerivationTest at the end of this file).
 
 #include <gtest/gtest.h>
 
@@ -94,6 +104,22 @@ const std::string kSkeleton{ kCanonicalSkeleton };
 {
     return '8' == character || '9' == character || 'a' == character || 'b' == character;
 }
+
+/// True for a hex digit spelled the way the text form requires: 0-9 or a-f.
+///
+/// Spelled out here rather than borrowed from Uuid.cpp on purpose — a test that
+/// judged the output with the implementation's own classifier could never
+/// disagree with it, which is exactly when a test is worth having.
+[[nodiscard]] bool isLowercaseHexDigit(char character)
+{
+    return ('0' <= character && '9' >= character) || ('a' <= character && 'f' >= character);
+}
+
+/// The canonical text the derivation tests feed to deriveUuidFromText. Tab
+/// separated and fixed in its field order, which is the caller's half of the
+/// contract: the function is deterministic over the bytes it is handed, and
+/// canonicalisation belongs to whoever builds the row's text.
+constexpr const char *kCanonicalRowText = "42\tclean the garage\t2026-10-08T09:00:00Z\t7";
 
 } // namespace
 
@@ -178,8 +204,10 @@ TEST(UuidGenerationTest, EmitsLowercaseHexOnly)
     // The generator's case is an interface, not a detail: the export is a set
     // of lines for git to merge, and two machines that spelled one uid
     // differently would look like two uids, breaking the "exactly one line per
-    // uid" property the whole format rests on. The checker's tolerance of
-    // uppercase (see below) is not licence for the generator to emit it.
+    // uid" property the whole format rests on. Together with
+    // UuidShapeTest.UppercaseHexIsRejected below, this test says the spelling
+    // is unique end to end: everything taskPilot writes is lowercase, and
+    // everything it reads back must be lowercase too.
     constexpr int kSampleSize{ 100 };
     bool sawLetter{ false };
 
@@ -402,26 +430,61 @@ TEST(UuidShapeTest, RejectsNonHexCharacters)
     }
 }
 
-TEST(UuidShapeTest, UppercaseHexIsAccepted)
+TEST(UuidShapeTest, UppercaseHexIsRejected)
 {
-    // DECISION: the checker is case-insensitive; the generator is not.
+    // DECISION REVERSED: this test used to be UppercaseHexIsAccepted, and it is
+    // inverted rather than deleted so the reversal stays visible to whoever
+    // reads the suite next.
     //
-    // Why accept: hex is case-insensitive in RFC 4122, and the variant nibble's
-    // documented set is 8/9/a/b — a checker that honoured uppercase everywhere
-    // EXCEPT that one position would need a rule nobody could remember. Since
-    // the generator only ever emits lowercase, this tolerance can only ever
-    // apply to a line that arrived from outside, where the alternative is
-    // refusing an entire export over a spelling.
+    // Why reject: every merge comparison keys on the uid STRING — the tasks.uid
+    // column with its unique index, and the lookup in mergeJsonl — so "9F3C…"
+    // and "9f3c…" are not two spellings of one identity, they are two
+    // identities. A checker that took both would let one task be inserted
+    // beside its own capitalised copy on every machine, and the shared export
+    // file would carry both spellings forever. Nothing inside taskPilot writes
+    // uppercase and nothing anywhere normalises case, so the lenient form had
+    // no producer it was serving.
     //
-    // What it costs, stated plainly: this function answers yes or no about a
-    // SHAPE, and the two spellings are two different strings. Anything that
-    // keyed on the string would therefore see one task twice if a uid were
-    // capitalised in transit — the generator is the only producer inside
-    // taskPilot, so that can only come from a hand-edited file.
-    EXPECT_TRUE(taskpilot::looksLikeUuidV4("9F3C1A2B-4D5E-4F60-8A9B-0C1D2E3F4A5B"));
-    EXPECT_TRUE(taskpilot::looksLikeUuidV4("9f3c1a2b-4d5e-4f60-8A9B-0c1d2e3f4a5b"));
-    EXPECT_TRUE(taskpilot::looksLikeUuidV4(withCharacterAt(kVariantIndex, 'A')));
-    EXPECT_TRUE(taskpilot::looksLikeUuidV4(withCharacterAt(kVariantIndex, 'B')));
+    // What it costs, stated plainly: a uid capitalised in transit — by a hand
+    // edit, or by a tool that is not taskPilot — is now refused outright
+    // instead of merged, and the refusal names the record and stops a merge
+    // that would otherwise have gone through. That is the intended trade: a
+    // loud refusal is recoverable, a silent duplicate is not.
+    EXPECT_FALSE(taskpilot::looksLikeUuidV4("9F3C1A2B-4D5E-4F60-8A9B-0C1D2E3F4A5B"));
+    EXPECT_FALSE(taskpilot::looksLikeUuidV4("9f3c1a2b-4d5e-4f60-8A9B-0c1d2e3f4a5b"));
+
+    // The variant nibble is where uppercase was most defensible — A and B name
+    // the same nibbles as a and b — so it is pinned on its own rather than left
+    // to the body's rule.
+    EXPECT_FALSE(taskpilot::looksLikeUuidV4(withCharacterAt(kVariantIndex, 'A')));
+    EXPECT_FALSE(taskpilot::looksLikeUuidV4(withCharacterAt(kVariantIndex, 'B')));
+
+    // Every uppercase letter, at a body position, and every lowercase one as
+    // the control: without the second loop the first would also pass if a hex
+    // LETTER were rejected for some reason unrelated to its case.
+    for (int code = 'A'; code <= 'F'; ++code)
+    {
+        const std::string text = withCharacterAt(2, static_cast<char>(code));
+        EXPECT_FALSE(taskpilot::looksLikeUuidV4(text))
+            << "unexpectedly accepted uppercase digit: " << text;
+    }
+    for (int code = 'a'; code <= 'f'; ++code)
+    {
+        const std::string text = withCharacterAt(2, static_cast<char>(code));
+        EXPECT_TRUE(taskpilot::looksLikeUuidV4(text))
+            << "unexpectedly rejected lowercase digit: " << text;
+    }
+
+    // This function IS the export parser's gate, not a second rule that might
+    // drift from it: TaskSync::parseJsonLine and the merge validation in
+    // TaskStore both refuse a record whose uid this function rejects, so a
+    // capitalised line cannot reach a merge, let alone a row. The assertion
+    // below is therefore the parser's own verdict, and the line after it is the
+    // guarantee that lowercasing the same uid still merges as one identity.
+    const std::string capitalised{ "9F3C1A2B-4D5E-4F60-8A9B-0C1D2E3F4A5B" };
+    const std::string lowercase{ "9f3c1a2b-4d5e-4f60-8a9b-0c1d2e3f4a5b" };
+    EXPECT_FALSE(taskpilot::looksLikeUuidV4(capitalised));
+    EXPECT_TRUE(taskpilot::looksLikeUuidV4(lowercase));
 }
 
 TEST(UuidShapeTest, TheVerdictIsTheSameEveryTime)
@@ -447,4 +510,167 @@ TEST(UuidShapeTest, TheVerdictIsTheSameEveryTime)
         const bool second = taskpilot::looksLikeUuidV4(text);
         EXPECT_EQ(first, second) << "verdict changed for [" << text << "]";
     }
+}
+
+TEST(UuidDerivationTest, IsDeterministicForTheSameText)
+{
+    // Determinism is the whole contract. Two machines that restored the same
+    // backup hold the SAME rows, and each derives the uid for those rows by
+    // hashing them; if the derivation varied between calls, each machine would
+    // assert a different uid for one task, the merge would see two unknown uids
+    // and insert both — the duplication the derivation exists to prevent.
+    const std::string canonical{ kCanonicalRowText };
+
+    const std::string first = taskpilot::deriveUuidFromText(canonical);
+    const std::string second = taskpilot::deriveUuidFromText(canonical);
+    EXPECT_EQ(first, second) << "repeated derivation disagreed: " << first << " vs " << second;
+
+    // The same CONTENT reached through a different string object, so a
+    // derivation that hashed the argument itself — a pointer, an address, a
+    // cached iterator — rather than the bytes it points at would fail here even
+    // though the two calls above agree.
+    std::string rebuilt{ "42\tclean the garage" };
+    rebuilt.append("\t2026-10-08T09:00:00Z\t7");
+    EXPECT_EQ(first, taskpilot::deriveUuidFromText(rebuilt));
+}
+
+TEST(UuidDerivationTest, DifferentTextsDeriveDifferentUuids)
+{
+    // Deliberately similar inputs: the collisions that matter are between rows
+    // that differ by one character (a typo, an edit), by length (a field that
+    // gained a digit), or by case — not between unrelated strings, which any
+    // digest separates. The empty string is included because it is the boundary
+    // a row with no fields at all produces.
+    const std::vector<std::string> texts{
+        "",
+        "a",
+        "b",
+        "aa",
+        "ab",
+        "clean the garage",
+        "clean the garage ",
+        "clean the garagE",
+        "42\tclean the garage",
+        "43\tclean the garage",
+        std::string(64, 'x'),
+        std::string(65, 'x'),
+    };
+
+    std::set<std::string> derived;
+    for (const std::string &text : texts)
+    {
+        const std::string uuid = taskpilot::deriveUuidFromText(text);
+        EXPECT_TRUE(derived.insert(uuid).second)
+            << "two canonical forms derived one uid " << uuid << "; the second is [" << text << "]";
+    }
+    EXPECT_EQ(texts.size(), derived.size());
+
+    // And the two 64-bit passes must be genuinely separate. Were both of them
+    // run with the same constants, the second eight bytes would be the first
+    // eight over again — byte i would equal byte i + 8 throughout — so the
+    // identifier would carry about 64 bits of content while Uuid.hpp's
+    // collision argument rests on 128.
+    //
+    // The comparison therefore takes only digits that are unstamped in BOTH
+    // halves: bytes 1 to 5 (digits 2 to 11) against bytes 9 to 13 (digits 18 to
+    // 27), five bytes in each. The version nibble overwrites byte 6's high
+    // nibble and the variant overwrites byte 8's top two bits, so comparing
+    // whole halves — or whole six-byte prefixes — would pass either way. Five
+    // bytes is the strongest clean invariant: a correct derivation matches them
+    // as a 2^-40 event, so over this sample a match says the two passes share
+    // their constants, not that this run was unlucky.
+    constexpr std::size_t kUnstampedOffset{ 2 };
+    constexpr std::size_t kUnstampedDigits{ 10 };
+    for (const std::string &text : texts)
+    {
+        const std::string uuid = taskpilot::deriveUuidFromText(text);
+        std::string digits;
+        for (const char character : uuid)
+        {
+            if ('-' != character)
+            {
+                digits.push_back(character);
+            }
+        }
+        ASSERT_EQ(std::size_t{ 32 }, digits.size());
+        EXPECT_NE(digits.substr(kUnstampedOffset, kUnstampedDigits),
+                  digits.substr(16 + kUnstampedOffset, kUnstampedDigits))
+            << "the two digest passes repeat one value: " << uuid;
+    }
+}
+
+TEST(UuidDerivationTest, OutputIsAWellFormedLowercaseUuid)
+{
+    // The v4 shape is what keeps the rest of the system single-path: the export
+    // parser, the merge lookup and the store's uid column all gate on
+    // looksLikeUuidV4, so a derived identifier that failed it would need a
+    // second branch everywhere it is read.
+    const std::vector<std::string> texts{
+        "",
+        "a",
+        kCanonicalRowText,
+        std::string(4096, 'q'), // a long canonical form, so length is not special
+    };
+
+    for (const std::string &text : texts)
+    {
+        const std::string uuid = taskpilot::deriveUuidFromText(text);
+        EXPECT_EQ(kUuidTextLength, uuid.size());
+        EXPECT_TRUE(taskpilot::looksLikeUuidV4(uuid)) << "derived uuid: " << uuid;
+
+        // Lowercase is asserted on its own rather than left to the shape check:
+        // the check's lowercase rule implies it today, and this is what keeps
+        // the promise if that rule is ever loosened again.
+        for (const char character : uuid)
+        {
+            if ('-' == character)
+            {
+                continue;
+            }
+            EXPECT_TRUE(isLowercaseHexDigit(character))
+                << "derived uuid carries " << character << ": " << uuid;
+        }
+
+        // The two stamped nibbles, checked here so a change that stopped
+        // stamping is named for what it is instead of surfacing as a generic
+        // shape failure.
+        EXPECT_EQ('4', uuid[kVersionIndex]) << "derived uuid: " << uuid;
+        EXPECT_TRUE(isLowercaseVariantNibble(uuid[kVariantIndex]))
+            << "derived variant nibble is " << uuid[kVariantIndex] << ": " << uuid;
+    }
+}
+
+TEST(UuidDerivationTest, EmptyTextIsALegalInputWithAStableUuid)
+{
+    // A row whose fields are all empty canonicalises to the empty string, and a
+    // migration may hand exactly that to the derivation. It is a legal input:
+    // it must yield a stable, well-formed uuid rather than crashing or
+    // producing something no reader accepts.
+    const std::string derived = taskpilot::deriveUuidFromText("");
+
+    EXPECT_EQ(kUuidTextLength, derived.size());
+    EXPECT_TRUE(taskpilot::looksLikeUuidV4(derived)) << derived;
+    EXPECT_EQ(derived, taskpilot::deriveUuidFromText("")) << "the empty input is not stable";
+
+    // A zeroed buffer is also stable and well-formed, so only an explicit
+    // comparison can see that shortcut: the value it produces is the nil uuid,
+    // which is the placeholder a malformed record is likeliest to carry, and
+    // two different things sharing one identity is the class of bug this file
+    // exists to prevent.
+    EXPECT_NE(std::string("00000000-0000-4000-8000-000000000000"), derived);
+}
+
+TEST(UuidDerivationTest, KnownTextKeepsItsKnownUuid)
+{
+    // A frozen test vector, pinned on purpose rather than because the value was
+    // convenient. The derived uid is how EVERY machine names a pre-uid row, so
+    // a change to a constant, to the byte layout or to the stamping makes a
+    // restored backup derive different uids for rows that already exist —
+    // every old task is then inserted twice, on every machine at once. No other
+    // test in this suite can see that: a self-consistent change to the
+    // derivation leaves all of them passing. If this ever fails, the fix is to
+    // restore the derivation, never to re-record the value.
+    const std::string canonical{ kCanonicalRowText };
+    EXPECT_EQ(std::string("66bf21eb-e764-456c-88bc-8bf6e2a4be80"),
+              taskpilot::deriveUuidFromText(canonical));
 }

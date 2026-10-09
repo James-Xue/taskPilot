@@ -133,8 +133,10 @@ score = importance_w × importance          # 1..5, default weight 5.0  ->  5 ..
 - **age** is the anti-starvation term: without it, low-importance work is
   permanently outranked and never surfaces.
 - **blocks** encodes "work that frees other work goes first".
-- Ties break on older `created_at` first, then lower `id` — a **total** order, so
-  the queue is reproducible across calls.
+- Ties break on older `created_at` first, then the smaller `uid` — a **total**
+  order, so the queue is reproducible across calls *and* identical on two
+  machines holding the same backlog. The local `id` is deliberately not the
+  final key: it is a row number on one machine only.
 
 Weights are data, not code: change them at runtime with `set_weights` (or the
 REPL's `weights urgency=45`) and they persist in the database. Validation is
@@ -194,20 +196,28 @@ them like the rest.
 One backlog can live on several machines. The database file stays local — it is
 personal data and this repository is public — so what travels is a **JSONL
 export** (one record per line) committed to a separate, **private** repository,
-conventionally `taskPilot-data`. Git can then merge two machines' files line by
-line; identity is a `uid` on every task, because the integer `id` means "the
-ninth row *this* database created" and is not portable.
+conventionally `taskPilot-data`, at the path `export/tasks.jsonl`. Git can then
+merge two machines' files line by line; identity is a `uid` on every task,
+because the integer `id` means "the ninth row *this* database created" and is
+not portable. Deletions travel too, as tombstone records: a merge **adopts** a
+tombstone even for a uid this machine never held, because a machine that dropped
+a deletion from its own export would watch the task come back on the machine
+that still had it.
 
 ```bash
 cd ~/1_Code/02_taskPilot
 DATA=~/1_Code/taskPilot-data
+EXPORT="$DATA/export/tasks.jsonl"
 
-git -C "$DATA" pull                                   # the other machine's records
-./run.sh import --file "$DATA/backlog.jsonl"          # dry run: what would change
-./run.sh import --file "$DATA/backlog.jsonl" --apply  # apply it
-./run.sh export --out "$DATA/backlog.jsonl"           # this machine's merged state
-git -C "$DATA" add backlog.jsonl && git -C "$DATA" commit -m sync && git -C "$DATA" push
+git -C "$DATA" pull                        # the other machine's records
+./run.sh import --file "$EXPORT"           # dry run: what would change
+./run.sh import --file "$EXPORT" --apply   # apply it
+./run.sh export --out "$EXPORT"            # this machine's merged state
+git -C "$DATA" add export/tasks.jsonl && git -C "$DATA" commit -m sync && git -C "$DATA" push
 ```
+
+(The data repository carries a `sync.sh` that runs exactly this sequence, with
+`./sync.sh --dry-run` for the preview.)
 
 `import` **defaults to a dry run** and only reports what a merge would change;
 the merge happens with `--apply`. That default is deliberate — a merge can
@@ -246,9 +256,12 @@ One SQLite file, `data/taskpilot.db` by default (`TASKPILOT_DB` overrides it).
 Three tables: `tasks` (each row carrying both a local `id` and the
 cross-machine `uid`), `tombstones` (one row per deleted task, so a deletion can
 travel to another machine — see [docs/sync.md](docs/sync.md)), and `settings`
-(the ranking weights). Copying that file is a complete backup.
-It is gitignored, and it should stay that way — it is personal backlog content,
-not source.
+(the ranking weights). Copying that file is a complete backup, and it is a
+supported way to move the backlog between machines: rows created before the
+`uid` column get a uid **derived from the row itself**, so two copies of one
+database derive the same uids and the first sync merges them rather than
+duplicating every task. The file is gitignored, and it should stay that way — it
+is personal backlog content, not source.
 
 ## Architecture
 

@@ -10,10 +10,12 @@
 //      therefore free, and every number in docs/scoring.md is exactly
 //      testable (see tests/unit/test_priority_engine.cpp).
 //
-//   2. The queue order is TOTAL — score, then created_at, then id. A
+//   2. The queue order is TOTAL — score, then created_at, then uid. A
 //      comparator that looked only at the score would leave the order of
 //      equal-scoring tasks up to the sort implementation and the caller's
-//      input order, which makes "why did this task move?" unanswerable.
+//      input order, which makes "why did this task move?" unanswerable. The
+//      final key is uid and never the local id: see precedesByKeys() for why
+//      only uid keeps the queue order comparable between two machines.
 //
 // docs/scoring.md is the specification for every rule implemented here. If
 // this file and that document disagree, this file is wrong.
@@ -25,6 +27,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -48,18 +51,32 @@ constexpr double kSecondsPerDayAsDouble{ 86400.0 };
 /// 1. Higher score first.
 /// 2. On a tie, older created_at first — the same fairness instinct as the
 ///    aging term: the task that has waited longer wins.
-/// 3. On a full tie, lower id first, so the result never depends on the input
-///    order or on which sort algorithm ran.
+/// 3. On a full tie, lower uid first, so the result never depends on the input
+///    order, on which sort algorithm ran, or on WHICH MACHINE did the sorting.
+///
+/// Key 3 compares uid and deliberately NOT the local integer id, because id is
+/// the one ranking input that is not portable: it is this database's row
+/// number, the sync format refuses to carry it (Task.hpp), and a merge assigns
+/// ids in uid order, which is random with respect to creation order. Two
+/// machines holding identical backlogs would therefore disagree about which of
+/// two tied tasks comes first if the fallback were the id — contradicting
+/// docs/sync.md, which promises the queue order is comparable across machines.
+/// uid is assigned once, never changes, and is unique per task, so it is both
+/// the portable key and the one that makes key 3 a total order rather than a
+/// partial one.
 ///
 /// Returns true when `lhs` must come before `rhs`.
 ///
 /// Precondition: every total is finite — Weights::validate() rejects
 /// non-finite weights and every remaining input is an integer — which is what
 /// makes this comparator a strict weak ordering (and therefore safe to hand
-/// to std::sort).
+/// to std::sort). Key 3 strengthens it to a strict TOTAL order on distinct
+/// tasks: uids are unique (v4, assigned once, never changed), so no two
+/// different tasks ever compare equivalent and the output order is fully
+/// determined.
 [[nodiscard]] bool precedesByKeys(double lhs_total, std::int64_t lhs_created_at,
-                                  std::int64_t lhs_id, double rhs_total,
-                                  std::int64_t rhs_created_at, std::int64_t rhs_id)
+                                  const std::string &lhs_uid, double rhs_total,
+                                  std::int64_t rhs_created_at, const std::string &rhs_uid)
 {
     // 1. Higher score first. Spelled as two ordered comparisons rather than
     //    `!=` followed by `>` so that the pair (a > b), (a < b) can never
@@ -80,9 +97,12 @@ constexpr double kSecondsPerDayAsDouble{ 86400.0 };
         return lhs_created_at < rhs_created_at;
     }
 
-    // 3. Lower id first — the final discriminator, so two distinct tasks
-    //    never compare equal and the output order is fully determined.
-    return lhs_id < rhs_id;
+    // 3. Lower uid first — the final discriminator. The comparison is the
+    //    ordinary lexicographic std::string order over the uuid's lowercase
+    //    hex and hyphens; every machine spells a uid the same way (the export
+    //    parser rejects any other case, see looksLikeUuidV4), so this key
+    //    yields the same answer on every machine holding the same tasks.
+    return lhs_uid < rhs_uid;
 }
 
 } // namespace
@@ -216,12 +236,14 @@ std::vector<RankedTask> PriorityEngine::rank(std::span<const Task> tasks, std::i
     //    tidiness: with equal-scoring tasks the queue would otherwise depend
     //    on the caller's input order and on the sort implementation's
     //    internals, so the same backlog could produce two different "next
-    //    task" answers on two runs. The three keys make that impossible.
+    //    task" answers on two runs. The three keys make that impossible — and
+    //    because the last key is uid (not the local id), the same backlog also
+    //    yields the same order on the OTHER machine.
     std::sort(ranked.begin(), ranked.end(),
               [](const RankedTask &lhs, const RankedTask &rhs)
               {
-                  return precedesByKeys(lhs.score.total, lhs.task.created_at, lhs.task.id,
-                                        rhs.score.total, rhs.task.created_at, rhs.task.id);
+                  return precedesByKeys(lhs.score.total, lhs.task.created_at, lhs.task.uid,
+                                        rhs.score.total, rhs.task.created_at, rhs.task.uid);
               });
 
     return ranked;
@@ -240,11 +262,16 @@ void PriorityEngine::sortByScore(std::vector<Task> &tasks, std::int64_t now, con
     // scale, and recomputing keeps this function honest about using the same
     // pure rules as rank() rather than a second, parallel implementation of
     // the key that could drift.
+    //
+    // The lambda delegates to precedesByKeys() for the same reason, one level
+    // down: the comparator for this overload and the one rank() installs are
+    // the SAME function, so rank() and sortByScore() cannot disagree about the
+    // order — including about the final key being uid.
     std::sort(tasks.begin(), tasks.end(),
               [&now, &weights](const Task &lhs, const Task &rhs)
               {
-                  return precedesByKeys(score(lhs, now, weights).total, lhs.created_at, lhs.id,
-                                        score(rhs, now, weights).total, rhs.created_at, rhs.id);
+                  return precedesByKeys(score(lhs, now, weights).total, lhs.created_at, lhs.uid,
+                                        score(rhs, now, weights).total, rhs.created_at, rhs.uid);
               });
 }
 

@@ -7,6 +7,14 @@
 // honest; a change that breaks them is a change to the ranking RULES, which
 // is a product decision rather than a refactor.
 //
+// The FINAL tie-break is uid, not the local id, and that is a portability
+// rule rather than a style one: the id differs by construction between two
+// machines holding the same backlog (a merge assigns ids in uid order), while
+// docs/sync.md promises the queue order IS comparable across machines. The
+// tie-break tests below therefore arrange uids to disagree with ids and with
+// the input order, so a comparator still keying on anything but the uid fails
+// them.
+//
 // The harness is time-free by construction: `now` is a fixed constant, so
 // every assertion below is exact and nothing here can become a flake.
 
@@ -47,12 +55,58 @@ constexpr double kTolerance = 1e-9;
 constexpr double kPrintedTableTolerance = 5e-3;
 constexpr double kPrintedProseTolerance = 1e-6;
 
+/// A v4-shaped uid derived from a small non-negative number, so every task a
+/// test builds carries a DISTINCT uid without each call site spelling out
+/// thirty-six characters.
+///
+/// The derived order tracks the number (the leading group is the number in
+/// zero-padded lowercase hex, and equal-width hex strings compare in numeric
+/// order). That coincidence is a convenience for the tests whose subject is
+/// NOT the tie-break, because it keeps their expected order readable; it is
+/// never relied on where the tie-break itself is under test. Those tests pass
+/// uids through makeTaskWithUid() and arrange them to DISAGREE with the ids
+/// and the input order, so nothing but a uid-keyed comparator can pass them.
+///
+/// Precondition: 0 <= number < 2^32 (the ids in this file are at most two
+/// digits). Wider values would lose their high bits and two of them could
+/// collide, which is exactly the "several tasks with the same uid" state these
+/// tests must avoid.
+std::string uidForNumber(std::int64_t number)
+{
+    constexpr char kHexDigits[] = "0123456789abcdef";
+    std::string leading(8, '0');
+    std::uint64_t remaining = static_cast<std::uint64_t>(number);
+    for (std::size_t index = leading.size(); 0 != index && 0 != remaining; --index)
+    {
+        leading[index - 1] = kHexDigits[static_cast<std::size_t>(remaining & 0xF)];
+        remaining >>= 4;
+    }
+    return leading + "-0000-4000-8000-000000000000";
+}
+
+/// Five v4-shaped uids listed in ASCENDING order. They differ only in their
+/// first character ('1', '3', '5', '7', '9' — all legal lowercase hex), so
+/// every comparison is decided at the first byte and the expected order of a
+/// tie-break test is readable straight off the constants' names. Ranking never
+/// validates the uuid SHAPE, but keeping these shape-legal costs nothing and
+/// means they would survive a trip through the export parser too.
+constexpr const char *kUidA = "1f3c1a2b-4d5e-4f60-8a9b-0c1d2e3f4a5b";
+constexpr const char *kUidB = "3f3c1a2b-4d5e-4f60-8a9b-0c1d2e3f4a5b";
+constexpr const char *kUidC = "5f3c1a2b-4d5e-4f60-8a9b-0c1d2e3f4a5b";
+constexpr const char *kUidD = "7f3c1a2b-4d5e-4f60-8a9b-0c1d2e3f4a5b";
+constexpr const char *kUidE = "9f3c1a2b-4d5e-4f60-8a9b-0c1d2e3f4a5b";
+
 /// Build an open task, exposing only the fields ranking reads so no test can
-/// accidentally depend on the rest.
+/// accidentally depend on the rest. The uid is derived from the id so that no
+/// task ever reaches the comparator with an EMPTY uid: several empty uids in a
+/// full tie would compare equivalent, which is legal for a strict weak
+/// ordering but would let a tie-break assertion pass by accident instead of by
+/// rule — the one thing these tests exist to prevent.
 Task makeTask(std::int64_t id, std::string title, int importance,
               std::optional<std::int64_t> due_at, std::int64_t created_at, int blocks)
 {
     Task task;
+    task.uid = uidForNumber(id);
     task.id = id;
     task.title = std::move(title);
     task.status = TaskStatus::kOpen;
@@ -61,6 +115,17 @@ Task makeTask(std::int64_t id, std::string title, int importance,
     task.blocks = blocks;
     task.created_at = created_at;
     task.updated_at = created_at;
+    return task;
+}
+
+/// Same as makeTask but with a caller-chosen uid. A tie-break test has to be
+/// able to place a uid deliberately — including in the REVERSE of the id order
+/// — so the uid must not be a function of the id there.
+Task makeTaskWithUid(std::string uid, std::int64_t id, std::string title, int importance,
+                     std::optional<std::int64_t> due_at, std::int64_t created_at, int blocks)
+{
+    Task task = makeTask(id, std::move(title), importance, due_at, created_at, blocks);
+    task.uid = std::move(uid);
     return task;
 }
 
@@ -438,7 +503,7 @@ TEST(PriorityEngineRank, AgingTermLiftsCAboveDAndRemovingItFlipsThemBack)
 // Tie-breaking and the total order
 // ---------------------------------------------------------------------------
 
-TEST(PriorityEngineRank, TiesBreakOnOlderCreatedAtThenLowerId)
+TEST(PriorityEngineRank, TiesBreakOnOlderCreatedAtThenLowerUid)
 {
     // age is switched off so created_at does NOT feed the score. That is what
     // makes the three totals genuinely equal: with aging on, the older task
@@ -446,10 +511,14 @@ TEST(PriorityEngineRank, TiesBreakOnOlderCreatedAtThenLowerId)
     Weights no_age;
     no_age.age = 0.0;
 
+    // The two created_at twins (twin, latecomer) carry uids in the REVERSE of
+    // their id order: the LARGER id gets the SMALLER uid. An implementation
+    // still falling back to the local id would put "latecomer" first; the
+    // comparator under test must instead follow the uid and put "twin" first.
     std::vector<Task> tasks{
-        makeTask(7, "younger-id", 3, std::nullopt, kNow - 2 * kSecondsPerDay, 0),
-        makeTask(2, "older", 3, std::nullopt, kNow - 5 * kSecondsPerDay, 0),
-        makeTask(4, "twin-lower-id", 3, std::nullopt, kNow - 2 * kSecondsPerDay, 0),
+        makeTaskWithUid(kUidE, 4, "latecomer", 3, std::nullopt, kNow - 2 * kSecondsPerDay, 0),
+        makeTaskWithUid(kUidC, 2, "older", 3, std::nullopt, kNow - 5 * kSecondsPerDay, 0),
+        makeTaskWithUid(kUidA, 7, "twin", 3, std::nullopt, kNow - 2 * kSecondsPerDay, 0),
     };
 
     const std::vector<RankedTask> ranked = PriorityEngine::rank(tasks, kNow, no_age);
@@ -461,9 +530,11 @@ TEST(PriorityEngineRank, TiesBreakOnOlderCreatedAtThenLowerId)
     }
 
     // "older" wins key 2. The two remaining tasks are a FULL tie (equal score
-    // and equal created_at), so they fall through to key 3 and the lower id
-    // wins: 4 before 7 — never the input order, which lists 7 first.
-    const std::vector<std::string> expected{ "older", "twin-lower-id", "younger-id" };
+    // and equal created_at), so they fall through to key 3, where the smaller
+    // uid wins: A (twin, id 7) before E (latecomer, id 4). The ids point the
+    // other way and the input lists the higher uid first, so both an id-keyed
+    // and an input-order-keyed answer are excluded by the same assertion.
+    const std::vector<std::string> expected{ "older", "twin", "latecomer" };
     EXPECT_EQ(expected, titlesOf(ranked));
 }
 
@@ -505,9 +576,13 @@ TEST(PriorityEngineRank, OrderIsIndependentOfInputOrderAndOfRepeatedCalls)
     // caller happened to hand the tasks over in, nor of the sort's internals.
     // Six tasks, including an exact score+created_at tie, exercise all three
     // keys.
+    //
+    // t1 and t3 tie on score and created_at, and their uids are arranged to
+    // OPPOSE their ids: the smaller id carries the larger uid. The queue must
+    // follow the uid — see the assertion at the end of the test.
     const std::vector<Task> tasks{
-        makeTask(3, "t3", 4, kNow + 2 * kSecondsPerDay, kNow - 2 * kSecondsPerDay, 1),
-        makeTask(1, "t1", 4, kNow + 2 * kSecondsPerDay, kNow - 2 * kSecondsPerDay, 1),
+        makeTaskWithUid(kUidA, 3, "t3", 4, kNow + 2 * kSecondsPerDay, kNow - 2 * kSecondsPerDay, 1),
+        makeTaskWithUid(kUidE, 1, "t1", 4, kNow + 2 * kSecondsPerDay, kNow - 2 * kSecondsPerDay, 1),
         makeTask(2, "t2", 5, std::nullopt, kNow - 30 * kSecondsPerDay, 0),
         makeTask(6, "t6", 1, kNow + 6 * kSecondsPerDay, kNow - 1 * kSecondsPerDay, 0),
         makeTask(4, "t4", 2, kNow + 10 * kSecondsPerDay, kNow, 4),
@@ -530,13 +605,129 @@ TEST(PriorityEngineRank, OrderIsIndependentOfInputOrderAndOfRepeatedCalls)
     std::shuffle(shuffled.begin(), shuffled.end(), generator);
     EXPECT_EQ(reference, titlesOf(PriorityEngine::rank(shuffled, kNow, Weights{})));
 
-    // The tie between t1 and t3 is resolved by id (1 before 3) rather than by
-    // whichever the input or the sort happened to place first.
+    // The tie between t1 and t3 is resolved by uid (A before E) — NOT by the
+    // input order, and NOT by the id either: t1 holds the smaller id but the
+    // larger uid, so an id-keyed comparator would put t1 first. t3 comes
+    // first, and the same answer survives the two rearrangements above.
     const auto t1 = std::find(reference.begin(), reference.end(), "t1");
     const auto t3 = std::find(reference.begin(), reference.end(), "t3");
     ASSERT_NE(reference.end(), t1);
     ASSERT_NE(reference.end(), t3);
-    EXPECT_LT(t1, t3);
+    EXPECT_LT(t3, t1);
+}
+
+// ---------------------------------------------------------------------------
+// The final tie-break is the uid — the only key two machines can agree on
+//
+// The local id is a row number, not an identity (Task.hpp): two machines both
+// have a row 9, a merge assigns ids in uid order — random with respect to
+// creation order — and the sync format does not transport ids at all. A tie
+// that fell through to the id would therefore order the SAME backlog
+// differently on two machines, while docs/sync.md promises the queue order IS
+// comparable. These three tests hold the comparator to the uid.
+// ---------------------------------------------------------------------------
+
+TEST(PriorityEngineRank, FullTieOrdersByUidAndSwappingTheUidsSwapsTheOrder)
+{
+    // alpha and beta tie on everything the first two keys can see: equal score
+    // (15 = importance 3 x 5, no deadline, no blocks, created at `now` so age
+    // is zero) and equal created_at. Only the uid can separate them.
+    //
+    // The ids are deliberately read the WRONG WAY ROUND — alpha carries the
+    // larger id — so this first arrangement is also one that a comparator
+    // still falling back to the id gets backwards.
+    const std::vector<Task> alpha_holds_the_lower_uid{
+        makeTaskWithUid(kUidA, 9, "alpha", 3, std::nullopt, kNow, 0),
+        makeTaskWithUid(kUidE, 1, "beta", 3, std::nullopt, kNow, 0),
+    };
+
+    const std::vector<RankedTask> ranked =
+        PriorityEngine::rank(alpha_holds_the_lower_uid, kNow, Weights{});
+    ASSERT_EQ(std::size_t{ 2 }, ranked.size());
+
+    // The tie is asserted, not assumed: if the scoring ever changed, this test
+    // must fail loudly instead of quietly checking a weaker property.
+    EXPECT_DOUBLE_EQ(ranked[0].score.total, ranked[1].score.total);
+    EXPECT_EQ(ranked[0].task.created_at, ranked[1].task.created_at);
+
+    const std::vector<std::string> alpha_first{ "alpha", "beta" };
+    EXPECT_EQ(alpha_first, titlesOf(ranked));
+
+    // Now exchange ONLY the uids, leaving ids, created_at, scores and the input
+    // order untouched. The expected order swaps — the single fact that proves
+    // the tie-break reads the uid.
+    const std::vector<Task> beta_holds_the_lower_uid{
+        makeTaskWithUid(kUidE, 9, "alpha", 3, std::nullopt, kNow, 0),
+        makeTaskWithUid(kUidA, 1, "beta", 3, std::nullopt, kNow, 0),
+    };
+    const std::vector<std::string> beta_first{ "beta", "alpha" };
+    EXPECT_EQ(beta_first,
+              titlesOf(PriorityEngine::rank(beta_holds_the_lower_uid, kNow, Weights{})));
+}
+
+TEST(PriorityEngineRank, FullTieOrderIsUnchangedWhenTheLocalIdsAreSwapped)
+{
+    // The same two tasks and the same uid arrangement twice; the ONLY
+    // difference between the two inputs is which of them holds which local id.
+    // If the comparator consulted the id at all, the two answers could not
+    // both match the uid order — and on the old comparator (lower id first)
+    // the first input answers "first" instead of "second" and fails here.
+    const std::vector<Task> ids_as_given{
+        makeTaskWithUid(kUidE, 1, "first", 3, std::nullopt, kNow, 0),
+        makeTaskWithUid(kUidA, 2, "second", 3, std::nullopt, kNow, 0),
+    };
+    const std::vector<Task> ids_swapped{
+        makeTaskWithUid(kUidE, 2, "first", 3, std::nullopt, kNow, 0),
+        makeTaskWithUid(kUidA, 1, "second", 3, std::nullopt, kNow, 0),
+    };
+
+    // "second" holds uid A and "first" holds uid E, so second comes first —
+    // whichever id each of them carries.
+    const std::vector<std::string> expected{ "second", "first" };
+    EXPECT_EQ(expected, titlesOf(PriorityEngine::rank(ids_as_given, kNow, Weights{})));
+    EXPECT_EQ(expected, titlesOf(PriorityEngine::rank(ids_swapped, kNow, Weights{})));
+}
+
+TEST(PriorityEngineRank, FullTieGroupOrdersByUidAndIgnoresInputOrder)
+{
+    // Five tasks in a FULL tie on keys 1 and 2: same score (15), same
+    // created_at, no deadline. Only the uid separates them, so the queue must
+    // come out in exactly ascending uid order: A, B, C, D, E.
+    //
+    // The ids are scrambled to oppose BOTH the uid order and the input order,
+    // so an implementation that reached for the id (or left the order to the
+    // sort's internals) cannot produce this sequence by accident.
+    const auto fullTieGroup = []()
+    {
+        return std::vector<Task>{
+            makeTaskWithUid(kUidC, 30, "C", 3, std::nullopt, kNow, 0),
+            makeTaskWithUid(kUidA, 50, "A", 3, std::nullopt, kNow, 0),
+            makeTaskWithUid(kUidE, 10, "E", 3, std::nullopt, kNow, 0),
+            makeTaskWithUid(kUidB, 40, "B", 3, std::nullopt, kNow, 0),
+            makeTaskWithUid(kUidD, 20, "D", 3, std::nullopt, kNow, 0),
+        };
+    };
+
+    const std::vector<std::string> expected{ "A", "B", "C", "D", "E" };
+    const std::vector<Task> tasks = fullTieGroup();
+    const std::vector<RankedTask> ranked = PriorityEngine::rank(tasks, kNow, Weights{});
+    ASSERT_EQ(std::size_t{ 5 }, ranked.size());
+    for (const RankedTask &entry : ranked)
+    {
+        EXPECT_DOUBLE_EQ(15.0, entry.score.total);
+    }
+    EXPECT_EQ(expected, titlesOf(ranked));
+
+    // A shuffled input (fixed seed, so a failure is reproducible) must give
+    // the identical answer, and so must the reversed one: the output is a
+    // function of the uids, never of the arrangement handed in.
+    std::mt19937 generator{ 20261008U };
+    std::vector<Task> shuffled = tasks;
+    std::shuffle(shuffled.begin(), shuffled.end(), generator);
+    EXPECT_EQ(expected, titlesOf(PriorityEngine::rank(shuffled, kNow, Weights{})));
+
+    const std::vector<Task> reversed(tasks.rbegin(), tasks.rend());
+    EXPECT_EQ(expected, titlesOf(PriorityEngine::rank(reversed, kNow, Weights{})));
 }
 
 // ---------------------------------------------------------------------------
@@ -546,8 +737,8 @@ TEST(PriorityEngineRank, OrderIsIndependentOfInputOrderAndOfRepeatedCalls)
 TEST(PriorityEngineRank, DropsDoneAndArchivedKeepsOpenAndInProgress)
 {
     std::vector<Task> tasks{
-        makeTask(1, "open", 3, std::nullopt, kNow, 0),
-        makeTask(2, "in-progress", 3, std::nullopt, kNow, 0),
+        makeTaskWithUid(kUidA, 1, "open", 3, std::nullopt, kNow, 0),
+        makeTaskWithUid(kUidB, 2, "in-progress", 3, std::nullopt, kNow, 0),
         makeTask(3, "done", 5, kNow, kNow - 100 * kSecondsPerDay, 9),
         makeTask(4, "archived", 5, kNow, kNow - 100 * kSecondsPerDay, 9),
     };
@@ -561,6 +752,9 @@ TEST(PriorityEngineRank, DropsDoneAndArchivedKeepsOpenAndInProgress)
     const std::vector<RankedTask> ranked = PriorityEngine::rank(tasks, kNow, Weights{});
     ASSERT_EQ(std::size_t{ 2 }, ranked.size());
 
+    // The two survivors are themselves a FULL tie — both score 15 with the
+    // same created_at — so their order comes from the uid key: A before B,
+    // which the uids assigned above make true by construction.
     const std::vector<std::string> expected{ "open", "in-progress" };
     EXPECT_EQ(expected, titlesOf(ranked));
     for (const RankedTask &entry : ranked)

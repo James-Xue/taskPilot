@@ -14,6 +14,15 @@
 // "5" into 5, or silently using a default for a misspelled key, would make a
 // failed call indistinguishable from a successful one — the worst possible
 // outcome for an LLM client that cannot read the daemon's logs.
+//
+// The same rule covers a key the method does not declare at all: it is refused
+// by name, together with the list of keys the method does accept, rather than
+// ignored. The case that matters is a mistyped `status` on list_tasks — the
+// caller believes it filtered and is handed the whole backlog — which is also
+// the likeliest mistake to make in the hand-written JSON these methods are
+// usually called with. rejectUnknownParameters() is the one place that
+// decision lives; the strictness there, against the deliberate tolerance of
+// the weights parser, is explained on the function itself.
 
 #include "control/Services.hpp"
 
@@ -217,6 +226,112 @@ constexpr const char *kNowParamKey{ "__taskpilot_now" };
                                       "' must not be negative, got " + std::to_string(*value));
     }
     out = static_cast<std::size_t>(*value);
+    return Unit{};
+}
+
+/// Refuse a parameter key the method does not declare.
+///
+/// One shared check rather than a copy per handler, and it is called from
+/// invoke() — the single choke point through which both transports reach every
+/// handler. A method added later is covered the moment its spec exists, and no
+/// handler can forget to ask for the check; a per-handler call would be exactly
+/// the kind of thing a new method omits.
+///
+/// The accepted set is derived from the method's own params_schema, i.e. from
+/// the catalog in methodSpecs(). That catalog is already the single source of
+/// truth for the wire vocabulary (JsonRpcServer's registry, McpServer's
+/// tools/list and describe_methods are all built from it), so taking the set
+/// from it means a parameter is accepted exactly when the catalog declares it:
+/// there is no second list to keep in step with the schemas, and a renamed
+/// parameter is refused under its old name the moment the schema stops
+/// declaring it.
+///
+/// Why a METHOD's parameters are strict while the weights PARSER stays lenient
+/// (see weightsFromJson): there, an unknown key is data a newer client sent, so
+/// ignoring it is forward compatibility. Here it is an instruction the caller
+/// is waiting on, and an ignored instruction produces a plausible-looking
+/// answer to a question the caller did not ask — a mistyped `status` on
+/// list_tasks returns the whole backlog while the caller believes it filtered.
+/// The caller is usually a model writing JSON by hand, and nothing else in the
+/// reply tells it the filter never ran.
+///
+/// kNowParamKey is exempt: invoke() stamps the instant it sampled into every
+/// call's params, and a value a client sends under that key is overwritten
+/// rather than honoured, so it is never caller input a handler could act on.
+/// Exempting it here — beside the code that writes it — is what keeps the
+/// reserved name from being reported to a caller who never sent it.
+///
+/// `spec` is null only if the catalog and the dispatch table have drifted,
+/// which test_services.cpp's catalog cross-check forbids. Skipping the check is
+/// then the conservative half: a method present in only one of the two tables
+/// keeps working, rather than every request to it being refused over a
+/// parameter set nobody declared.
+///
+/// The message names the offending key AND lists the accepted ones (or says the
+/// method takes none). The accepted list is the actionable half — it is what
+/// lets a caller correct the request in one turn instead of bisecting it
+/// against the documentation.
+[[nodiscard]] Status rejectUnknownParameters(const MethodSpec *spec,
+                                             const nlohmann::json &params)
+{
+    if (nullptr == spec)
+    {
+        return Unit{};
+    }
+
+    // Every schema is assembled by objectSchema(), which always emits an object
+    // "properties" (the catalog test asserts it), so a spec without one is a
+    // build defect rather than a method that takes anything. It is treated as
+    // declaring nothing: skipping the check instead would silently reopen the
+    // hole this function exists to close.
+    const auto properties = spec->params_schema.find("properties");
+    const bool hasProperties =
+        properties != spec->params_schema.end() && properties->is_object();
+
+    for (auto entry = params.begin(); entry != params.end(); ++entry)
+    {
+        const std::string key = entry.key();
+        if (kNowParamKey == key)
+        {
+            continue;
+        }
+        if (hasProperties && properties->contains(key))
+        {
+            continue;
+        }
+
+        // The accepted names come from the schema's own key order (nlohmann
+        // keeps an object's keys sorted), so the same request always reports
+        // the same list in the same order and a test can assert on it.
+        std::string accepted;
+        if (hasProperties)
+        {
+            for (auto property = properties->begin(); property != properties->end();
+                 ++property)
+            {
+                if (!accepted.empty())
+                {
+                    accepted += ", ";
+                }
+                accepted += property.key();
+            }
+        }
+
+        std::string message =
+            "unknown parameter '" + key + "' for method '" + spec->name + "'";
+        if (accepted.empty())
+        {
+            // A method that takes nothing says so, rather than offering an
+            // empty list that reads like a formatting bug.
+            message += "; the method accepts no parameters";
+        }
+        else
+        {
+            message += "; accepted parameters: " + accepted;
+        }
+        return Error::invalidArgument(std::move(message));
+    }
+
     return Unit{};
 }
 
@@ -1430,6 +1545,18 @@ RpcResult Services::invoke(const std::string &method, const nlohmann::json &para
     // exactly the non-reproducible ordering PriorityEngine's total order
     // exists to prevent.
     stamped[kNowParamKey] = m_clock.nowEpochSeconds();
+
+    // An undeclared key is refused here, once, for every method: the handlers
+    // are private and reachable only through this function, so none can opt out
+    // and a method added later is covered as soon as its spec exists. The check
+    // runs AFTER the stamp, on the params a handler will actually see, so the
+    // reserved key exempts itself in the same place that writes it rather than
+    // being reported as a key the caller never sent.
+    const Status known = rejectUnknownParameters(Services::findSpec(method), stamped);
+    if (!known.ok())
+    {
+        return known.error();
+    }
 
     return (this->*(handler->second))(stamped);
 }

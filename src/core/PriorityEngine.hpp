@@ -90,8 +90,17 @@ class PriorityEngine
     /// 1. Higher score first.
     /// 2. On a tie, older created_at first — a task that has waited longer
     ///    wins, which is the same fairness instinct as the aging term.
-    /// 3. On a full tie, lower id first, so the result never depends on the
-    ///    input order or on the sort implementation.
+    /// 3. On a full tie, the smaller `uid` first, so the result never depends
+    ///    on the input order or on the sort implementation.
+    ///
+    /// Step 3 deliberately uses `uid` rather than the integer `id`. The id is a
+    /// LOCAL row number and is not transported by the sync format (see Task.id
+    /// and docs/sync.md), and a merge assigns ids in uid order — which is
+    /// random with respect to creation order. Tying on it would therefore make
+    /// the queue order differ between two machines holding identical backlogs,
+    /// contradicting the guarantee docs/sync.md makes that the order IS
+    /// comparable across machines. `uid` is the one field every machine agrees
+    /// on, so it is the only correct final tie-break.
     [[nodiscard]] static std::vector<RankedTask> rank(std::span<const Task> tasks,
                                                       std::int64_t now,
                                                       const Weights &weights);
