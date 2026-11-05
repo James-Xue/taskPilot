@@ -44,10 +44,12 @@ Each `.cpp` is compiled into exactly one target.
 
 The UI targets:
 
-- `taskpilot-ui-core` — `AppController`, `QueueModel`, `TaskFilterModel`
-  (Qt Core/Gui, links `taskPilot::result` only).
+- `taskpilot-ui-core` — `QueueModel`, `TaskFilterModel` (Qt Core, links
+  `taskPilot::result` only).
 - `taskpilot-ui-desktop` — `ControlWorker` (Qt Core, links `taskPilot::client`).
-- `taskpilot-ui` — `main.cpp` + QML resources, links the two above; `ldd` must
+- `taskpilot-ui-controller` — `AppController` (owns the worker thread and the
+  models; links the desktop client).
+- `taskpilot-ui` — `main.cpp` + QML resources, links the three above; `ldd` must
   show no SQLite.
 
 Qt is optional: `TASKPILOT_UI` defaults ON but degrades to a STATUS message when
@@ -71,7 +73,13 @@ notes/score/scoreParts/urgencyFactor/ageDays/dueText/hasDue roles, plus
 
 `TaskFilterModel` is an order-preserving `QSortFilterProxyModel`: OR semantics
 over selected tags, case-insensitive title/notes search, counts from the source
-model. Selection is restored by id after `endResetModel()`.
+model. Selection is restored by task id after `endResetModel()`; a row index is
+not an identity, and a refresh that reorders the queue must not leave the detail
+pane pointing at another task.
+
+`get_queue` uses a raised 64 MiB reply cap because its reply is the whole queue
+and the client's 1 MiB default would eventually make every refresh fail. The cap
+is a runaway guard, not a size policy.
 
 Mutations are one RPC each; success triggers a refresh, failure leaves the model
 untouched. Errors are values (`kInvalidArgument`, `kNotFound`, `kConflict`,
@@ -128,7 +136,9 @@ green; UI build produces `taskpilot-ui`; `ldd` clean.
 
 M1 — desktop MVP. Acceptance: with the daemon running, the queue order matches
 `./run.sh cli` `queue`; with it stopped, the offline banner appears and the
-window stays interactive; add/complete/reopen/delete work; tests pass.
+window stays interactive; add/complete/delete work; tests pass. `reopen_task` is
+wired in the controller, but a completed task cannot appear in the queue, so
+reopening needs a history view, which is deferred.
 
 M2 — Windows MSVC compile verification (report only). MSVC 2022 and Qt 6.12
 `msvc2022_64` are required; this machine has neither, and the daemon also uses
