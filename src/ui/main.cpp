@@ -39,7 +39,9 @@ int main(int argc, char *argv[])
     QGuiApplication app(argc, argv);
     QCoreApplication::setApplicationName(QStringLiteral("taskPilot UI"));
     QCoreApplication::setOrganizationName(QStringLiteral("taskPilot"));
-    QQuickStyle::setStyle(QStringLiteral("Material"));
+    // Basic gives the custom QML controls a neutral base; the Apple-style
+    // look lives in the app's own components and Theme tokens.
+    QQuickStyle::setStyle(QStringLiteral("Basic"));
 
     QCommandLineParser parser;
     parser.setApplicationDescription(
@@ -56,10 +58,14 @@ int main(int argc, char *argv[])
     const QCommandLineOption selectFirstOption(
         QStringLiteral("select-first"),
         QStringLiteral("Select the first queue row before capturing (screenshot checks)."));
+    const QCommandLineOption openAddDialogOption(
+        QStringLiteral("open-add-dialog"),
+        QStringLiteral("Open the Add task dialog before capturing (screenshot checks)."));
     parser.addOption(hostOption);
     parser.addOption(portOption);
     parser.addOption(screenshotOption);
     parser.addOption(selectFirstOption);
+    parser.addOption(openAddDialogOption);
     parser.process(app);
 
     // Precedence matches the daemon: built-in default < environment < flag.
@@ -116,8 +122,9 @@ int main(int argc, char *argv[])
     if (!screenshotPath.isEmpty())
     {
         const bool selectFirst = parser.isSet(selectFirstOption);
+        const bool openAddDialog = parser.isSet(openAddDialogOption);
         QTimer::singleShot(2500, &app,
-                           [&engine, screenshotPath, selectFirst, &app]
+                           [&engine, screenshotPath, selectFirst, openAddDialog, &app]
                            {
                                auto *window =
                                    qobject_cast<QQuickWindow *>(engine.rootObjects().constFirst());
@@ -137,18 +144,32 @@ int main(int argc, char *argv[])
                                        QCoreApplication::processEvents();
                                    }
                                }
-                               const QImage image = window->grabWindow();
-                               if (image.isNull() || !image.save(screenshotPath, "PNG"))
+                               auto capture = [&app, window, screenshotPath]
                                {
-                                   std::fprintf(stderr,
-                                                "taskpilot-ui: failed to save screenshot to %s\n",
+                                   const QImage image = window->grabWindow();
+                                   if (image.isNull() || !image.save(screenshotPath, "PNG"))
+                                   {
+                                       std::fprintf(stderr,
+                                                    "taskpilot-ui: failed to save screenshot to %s\n",
+                                                    qPrintable(screenshotPath));
+                                       app.exit(1);
+                                       return;
+                                   }
+                                   std::fprintf(stdout, "taskpilot-ui: screenshot saved to %s\n",
                                                 qPrintable(screenshotPath));
-                                   app.exit(1);
+                                   app.exit(0);
+                               };
+                               if (openAddDialog)
+                               {
+                                   if (auto *shell = window->findChild<QQuickItem *>(
+                                           QStringLiteral("desktopShell")))
+                                   {
+                                       QMetaObject::invokeMethod(shell, "openAddDialog");
+                                   }
+                                   QTimer::singleShot(500, &app, capture);
                                    return;
                                }
-                               std::fprintf(stdout, "taskpilot-ui: screenshot saved to %s\n",
-                                            qPrintable(screenshotPath));
-                               app.exit(0);
+                               capture();
                            });
     }
 

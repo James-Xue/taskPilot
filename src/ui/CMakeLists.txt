@@ -58,4 +58,10 @@ qt_add_resources(taskpilot-ui "ui-qml"
         qml/TaskDelegate.qml
         qml/DetailPane.qml
         qml/TagPane.qml
-        qml/AddTaskDialog.qml)
+        qml/AddTaskDialog.qml
+        qml/Theme.qml
+        qml/AppButton.qml
+        qml/AppTextField.qml
+        qml/AppCheckBox.qml
+        qml/AppSpinBox.qml
+        qml/AppScrollBar.qml)

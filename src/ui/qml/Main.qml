@@ -1,7 +1,6 @@
 import QtQuick
 import QtQuick.Controls
-import QtQuick.Controls.Material
-import QtQuick.Layouts
+import QtCore
 
 ApplicationWindow {
     id: window
@@ -11,16 +10,30 @@ ApplicationWindow {
     minimumWidth: 900
     minimumHeight: 600
     title: "taskPilot"
+    color: theme.windowBg
 
-    Material.theme: Material.Dark
-    Material.accent: "#4c8dff"
-    Material.primary: "#2b6cb0"
+    Settings {
+        id: uiSettings
+        category: "ui"
+        property string theme: "dark"
+    }
+
+    readonly property bool darkTheme: uiSettings.theme !== "light"
+
+    Theme {
+        id: theme
+        dark: window.darkTheme
+    }
 
     DesktopShell {
         id: shell
+        objectName: "desktopShell"
         anchors.fill: parent
         controller: appController
         queueModel: taskQueueModel
+        theme: theme
+        darkTheme: window.darkTheme
+        onToggleTheme: uiSettings.theme = window.darkTheme ? "light" : "dark"
     }
 
     Shortcut {

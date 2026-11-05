@@ -6,6 +6,7 @@ Item {
     id: root
     property var controller
     property var queueModel
+    property var theme
     property var currentTask: ({})
     // The selected task identity, kept across a model reset. Row indexes are
     // not identities: a refresh can move the same task to another row, and a
@@ -68,30 +69,74 @@ Item {
         }
     }
 
+    // First run: show the top-ranked task instead of an empty detail pane.
+    function ensureSelection() {
+        if (root.selectedId < 0 && list.count > 0) {
+            root.selectRow(0)
+        }
+    }
+
     Connections {
         target: root.queueModel
         function onModelReset() {
             root.restoreSelection()
+            root.ensureSelection()
         }
         function onRowsInserted() {
             root.restoreFromInsert()
+            root.ensureSelection()
         }
+    }
+
+    Component.onCompleted: Qt.callLater(root.ensureSelection)
+
+    Rectangle {
+        anchors.fill: parent
+        color: root.theme ? root.theme.sidebarBg : "transparent"
     }
 
     ColumnLayout {
         anchors.fill: parent
-        anchors.margins: 8
-        spacing: 6
+        anchors.margins: 20
+        spacing: 10
+
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 8
+
+            Label {
+                text: "Queue"
+                font.family: root.theme ? root.theme.fontFamily : ""
+                font.pixelSize: 17
+                font.weight: Font.DemiBold
+                color: root.theme ? root.theme.textPrimary : "#1d1d1f"
+            }
+            Rectangle {
+                radius: 8
+                color: root.theme ? root.theme.accentSoft : "#e5f0ff"
+                implicitWidth: countLabel.implicitWidth + 14
+                implicitHeight: 20
+
+                Label {
+                    id: countLabel
+                    anchors.centerIn: parent
+                    text: list.count
+                    font.family: root.theme ? root.theme.fontFamily : ""
+                    font.pixelSize: 11
+                    font.weight: Font.DemiBold
+                    color: root.theme ? root.theme.accent : "#007aff"
+                }
+            }
+            Item {
+                Layout.fillWidth: true
+            }
+        }
 
         Label {
-            text: "Queue · " + list.count
-            font.bold: true
-            font.pixelSize: 15
-        }
-        Label {
             text: "Ranked by the daemon"
-            opacity: 0.6
-            font.pixelSize: 11
+            font.family: root.theme ? root.theme.fontFamily : ""
+            font.pixelSize: 12
+            color: root.theme ? root.theme.textTertiary : "#6e6e73"
         }
 
         ListView {
@@ -102,10 +147,16 @@ Item {
             clip: true
             spacing: 2
             model: root.queueModel
-            ScrollBar.vertical: ScrollBar {}
+            // The delegate paints its own rounded selection wash; the Basic
+            // style's default highlight would draw a black bar over it.
+            highlight: Item {}
+            ScrollBar.vertical: AppScrollBar {
+                theme: root.theme
+            }
 
             delegate: TaskDelegate {
                 width: list.width
+                theme: root.theme
                 selected: taskId === root.selectedId
                 onClicked: root.selectRow(index)
             }
@@ -118,7 +169,9 @@ Item {
                        || root.controller.activeTags.length > 0))
                   ? "No tasks match the filters."
                   : "No actionable tasks."
-            opacity: 0.6
+            font.family: root.theme ? root.theme.fontFamily : ""
+            font.pixelSize: 12
+            color: root.theme ? root.theme.textTertiary : "#6e6e73"
         }
     }
 }
