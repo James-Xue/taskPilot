@@ -196,7 +196,7 @@ if(TASKPILOT_UI_ENABLED)
     # Pin the major/minor: the system Qt (6.10 here) must not silently win over
     # the 6.12 kit the UI is developed against.
     find_package(Qt6 6.12 QUIET COMPONENTS
-        Core Gui Qml Quick QuickControls2 Test QuickTest)
+        Core Gui Qml Quick QuickControls2)
     if(Qt6_FOUND)
         qt_standard_project_setup()
         add_subdirectory(src/ui)
