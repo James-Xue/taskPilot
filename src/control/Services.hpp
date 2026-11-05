@@ -25,6 +25,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "control/RpcTypes.hpp"
 #include "core/Clock.hpp"
 #include "core/Result.hpp"
 #include "core/TaskStore.hpp"
@@ -40,8 +41,8 @@ struct MethodSpec
     nlohmann::json params_schema; ///< JSON Schema (type: object) for params.
 };
 
-/// Result type of a call, matching JsonRpcServer's handler contract.
-using RpcResult = Result<nlohmann::json>;
+/// Handler type, matching JsonRpcServer's contract. The reply alias itself
+/// lives in RpcTypes.hpp so clients can use it without this header.
 using MethodHandler = std::function<RpcResult(const nlohmann::json &params)>;
 using MethodRegistry = std::unordered_map<std::string, MethodHandler>;
 

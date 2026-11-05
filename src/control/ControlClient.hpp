@@ -21,7 +21,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "control/Services.hpp"
+#include "control/RpcTypes.hpp"
 
 namespace taskpilot
 {
