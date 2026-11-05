@@ -38,3 +38,9 @@ gtest_discover_tests(taskpilot_tests
     PROPERTIES
         TIMEOUT 60
     DISCOVERY_TIMEOUT 30)
+
+# UI tests exist only when the optional Qt target was configured. On a machine
+# without Qt this block adds nothing, so the headless test set is unchanged.
+if(TARGET taskpilot-ui-core)
+    add_subdirectory(ui)
+endif()
