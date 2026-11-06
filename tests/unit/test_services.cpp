@@ -175,7 +175,7 @@ TEST_F(ServicesTest, GetStatusReportsIdentityAndBacklog)
 
     EXPECT_EQ(status.at("version").get<std::string>(), kVersion);
     EXPECT_EQ(status.at("db_path").get<std::string>(), ":memory:");
-    EXPECT_EQ(status.at("method_count").get<int>(), 15);
+    EXPECT_EQ(status.at("method_count").get<std::size_t>(), Services::methodSpecs().size());
     EXPECT_GE(status.at("uptime_seconds").get<std::int64_t>(), 0);
 
     // The store's tallies are merged at the top level of the reply, so the
@@ -198,7 +198,7 @@ TEST_F(ServicesTest, DescribeMethodsReturnsTheWholeCatalog)
     const nlohmann::json catalog = callOk(harness.services, "describe_methods");
 
     ASSERT_TRUE(catalog.is_array());
-    ASSERT_EQ(catalog.size(), 15U);
+    ASSERT_EQ(catalog.size(), Services::methodSpecs().size());
 
     std::vector<std::string> names;
     for (const nlohmann::json &entry : catalog)
@@ -629,6 +629,115 @@ TEST_F(ServicesTest, ListTasksHonoursEveryOrdering)
     const std::vector<std::string> top =
         titlesOf(callOk(harness.services, "list_tasks", { { "limit", 1 } }));
     EXPECT_EQ(top, (std::vector<std::string>{ "middle" }));
+}
+
+TEST_F(ServicesTest, ListTasksFiltersByTextAndMultipleTags)
+{
+    addTask(harness.services, "buy milk",
+            { { "tags", nlohmann::json::array({ "home", "urgent" }) },
+              { "notes", "from the corner shop" } });
+    addTask(harness.services, "write the report",
+            { { "tags", nlohmann::json::array({ "work" }) } });
+    addTask(harness.services, "buy coffee",
+            { { "tags", nlohmann::json::array({ "work", "urgent" }) } });
+
+    const auto titlesOf = [](const nlohmann::json &tasks)
+    {
+        std::vector<std::string> titles;
+        for (const nlohmann::json &task : tasks)
+        {
+            titles.push_back(task.at("title").get<std::string>());
+        }
+        return titles;
+    };
+    const auto createdOrder = [](nlohmann::json params)
+    {
+        params["order"] = "created";
+        return params;
+    };
+
+    // Text matches the title, case-insensitively, and the notes as well.
+    EXPECT_EQ(titlesOf(callOk(harness.services, "list_tasks",
+                              createdOrder({ { "query", "BUY" } }))),
+              (std::vector<std::string>{ "buy milk", "buy coffee" }));
+    EXPECT_EQ(titlesOf(callOk(harness.services, "list_tasks",
+                              createdOrder({ { "query", "corner" } }))),
+              (std::vector<std::string>{ "buy milk" }));
+
+    // tags is an OR list; tag and tags are unioned rather than one winning.
+    EXPECT_EQ(titlesOf(callOk(harness.services, "list_tasks",
+                              createdOrder({ { "tags", nlohmann::json::array({ "home", "urgent" }) } }))),
+              (std::vector<std::string>{ "buy milk", "buy coffee" }));
+    EXPECT_EQ(titlesOf(callOk(harness.services, "list_tasks",
+                              createdOrder({ { "tag", "home" },
+                                             { "tags", nlohmann::json::array({ "work" }) } }))),
+              (std::vector<std::string>{ "buy milk", "write the report", "buy coffee" }));
+
+    // Text and tags combine with AND, exactly like the desktop filters.
+    EXPECT_EQ(titlesOf(callOk(harness.services, "list_tasks",
+                              createdOrder({ { "query", "buy" },
+                                             { "tags", nlohmann::json::array({ "work" }) } }))),
+              (std::vector<std::string>{ "buy coffee" }));
+
+    // The limit applies after filtering, not before it.
+    EXPECT_EQ(titlesOf(callOk(harness.services, "list_tasks",
+                              { { "query", "coffee" }, { "limit", 1 } })),
+              (std::vector<std::string>{ "buy coffee" }));
+}
+
+TEST_F(ServicesTest, GetQueueFiltersByTextAndMultipleTags)
+{
+    addTask(harness.services, "buy milk",
+            { { "tags", nlohmann::json::array({ "home", "urgent" }) },
+              { "notes", "from the corner shop" } });
+    addTask(harness.services, "write the report",
+            { { "tags", nlohmann::json::array({ "work" }) } });
+    addTask(harness.services, "buy coffee",
+            { { "tags", nlohmann::json::array({ "work", "urgent" }) } });
+
+    const auto sortedTitles = [](const nlohmann::json &reply)
+    {
+        std::vector<std::string> titles;
+        for (const nlohmann::json &entry : reply.at("queue"))
+        {
+            titles.push_back(entry.at("title").get<std::string>());
+        }
+        std::sort(titles.begin(), titles.end());
+        return titles;
+    };
+
+    EXPECT_EQ(sortedTitles(callOk(harness.services, "get_queue", { { "query", "BUY" } })),
+              (std::vector<std::string>{ "buy coffee", "buy milk" }));
+    EXPECT_EQ(sortedTitles(callOk(harness.services, "get_queue",
+                                  { { "tags", nlohmann::json::array({ "home", "work" }) } })),
+              (std::vector<std::string>{ "buy coffee", "buy milk", "write the report" }));
+    EXPECT_EQ(sortedTitles(callOk(harness.services, "get_queue",
+                                  { { "query", "coffee" },
+                                    { "tags", nlohmann::json::array({ "work" }) } })),
+              (std::vector<std::string>{ "buy coffee" }));
+}
+
+TEST_F(ServicesTest, GetTagsCountsOnlyActionableTasks)
+{
+    addTask(harness.services, "buy milk",
+            { { "tags", nlohmann::json::array({ "home", "urgent" }) } });
+    addTask(harness.services, "write the report",
+            { { "tags", nlohmann::json::array({ "work", "urgent" }) } });
+    const nlohmann::json finished = addTask(
+        harness.services, "old news", { { "tags", nlohmann::json::array({ "archived-only" }) } });
+    callOk(harness.services, "complete_task", { { "id", finished.at("id") } });
+
+    const nlohmann::json tags = callOk(harness.services, "get_tags");
+    ASSERT_TRUE(tags.is_array());
+    ASSERT_EQ(tags.size(), 3U);
+
+    // Alphabetical, with the finished task's tag absent.
+    EXPECT_EQ(tags.at(0).at("tag").get<std::string>(), "home");
+    EXPECT_EQ(tags.at(0).at("count").get<int>(), 1);
+    EXPECT_EQ(tags.at(1).at("tag").get<std::string>(), "urgent");
+    EXPECT_EQ(tags.at(1).at("count").get<int>(), 2);
+    EXPECT_EQ(tags.at(2).at("tag").get<std::string>(), "work");
+    EXPECT_EQ(tags.at(2).at("count").get<int>(), 1);
 }
 
 TEST_F(ServicesTest, GetTaskReportsTheScoreWithItsBreakdown)
@@ -1362,14 +1471,21 @@ TEST_F(ServicesTest, EveryMethodStillAcceptsItsOwnDeclaredParameters)
         { "complete_task", nlohmann::json{ { "id", toComplete.at("id") } } },
         { "reopen_task", nlohmann::json{ { "id", toReopen.at("id") } } },
         { "delete_task", nlohmann::json{ { "id", toDelete.at("id") } } },
-        { "get_queue", nlohmann::json{ { "limit", 1 }, { "include_in_progress", true } } },
+        { "get_queue",
+          nlohmann::json{ { "limit", 1 },
+                          { "include_in_progress", true },
+                          { "query", "sampled" },
+                          { "tags", nlohmann::json::array({ "sample" }) } } },
         { "list_tasks",
           nlohmann::json{ { "status", "open" },
                           { "tag", "sample" },
+                          { "tags", nlohmann::json::array({ "sample" }) },
+                          { "query", "sampled" },
                           { "limit", 1 },
                           { "order", "created" } } },
         { "get_task", nlohmann::json{ { "id", toFetch.at("id") } } },
         { "get_stats", nlohmann::json::object() },
+        { "get_tags", nlohmann::json::object() },
         { "export_tasks", nlohmann::json::object() },
         { "import_tasks",
           nlohmann::json{ { "jsonl", ownExport.at("jsonl") }, { "dry_run", true } } },

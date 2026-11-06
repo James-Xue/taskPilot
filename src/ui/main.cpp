@@ -10,6 +10,7 @@
 #include <QCommandLineParser>
 #include <QCoreApplication>
 #include <QGuiApplication>
+#include <QIcon>
 #include <QImage>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
@@ -39,6 +40,7 @@ int main(int argc, char *argv[])
     QGuiApplication app(argc, argv);
     QCoreApplication::setApplicationName(QStringLiteral("taskPilot UI"));
     QCoreApplication::setOrganizationName(QStringLiteral("taskPilot"));
+    QGuiApplication::setWindowIcon(QIcon(QStringLiteral(":/ui/icons/taskpilot-256.png")));
     // Basic gives the custom QML controls a neutral base; the Apple-style
     // look lives in the app's own components and Theme tokens.
     QQuickStyle::setStyle(QStringLiteral("Basic"));

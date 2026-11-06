@@ -114,6 +114,7 @@ class Services
     [[nodiscard]] RpcResult handleListTasks(const nlohmann::json &params);
     [[nodiscard]] RpcResult handleGetTask(const nlohmann::json &params);
     [[nodiscard]] RpcResult handleGetStats(const nlohmann::json &params);
+    [[nodiscard]] RpcResult handleGetTags(const nlohmann::json &params);
 
     // --- synchronisation ---
     [[nodiscard]] RpcResult handleExportTasks(const nlohmann::json &params);

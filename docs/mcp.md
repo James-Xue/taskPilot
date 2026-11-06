@@ -298,10 +298,11 @@ MCP, the control socket, and the REPL.
 | `complete_task` | `id` | Mark done and stamp `completed_at`. |
 | `reopen_task` | `id` | Put a done or archived task back in the queue as open. |
 | `delete_task` | `id` | Permanently delete; returns `{"deleted": true, "id": N}`. |
-| `get_queue` | `limit`, `include_in_progress` (default `true`) | The ranked queue with each entry's `score` and `score_parts`. |
-| `list_tasks` | `status`, `tag`, `limit`, `order` (`score` \| `created` \| `due`) | Browse and filter; returns an array of tasks. |
+| `get_queue` | `limit`, `include_in_progress` (default `true`), `query`, `tags` (OR) | The ranked queue with each entry's `score` and `score_parts`; `query` matches title or notes case-insensitively. |
+| `list_tasks` | `status`, `tag`, `tags`, `query`, `limit`, `order` (`score` \| `created` \| `due`) | Browse and filter; `tags` is an OR list, `query` matches the title or notes case-insensitively. Returns an array of tasks. |
 | `get_task` | `id` | One task with its current score and the breakdown behind it. |
 | `get_stats` | — | Counts by state, overdue and due-within-24h tallies, plus `top_title` and `top_score`. |
+| `get_tags` | — | Tags carried by actionable tasks (open or in progress) with per-tag counts, alphabetical. Backs the desktop Filters panel. |
 | `get_weights` | — | The current ranking weights and urgency horizon. |
 | `set_weights` | `importance`, `urgency`, `age`, `blocks`, `urgency_horizon_days` | Partial retune; validated before it is stored. |
 

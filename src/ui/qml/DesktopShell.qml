@@ -52,12 +52,22 @@ Item {
                 anchors.rightMargin: 20
                 spacing: 10
 
+                Image {
+                    source: "qrc:/ui/icons/taskpilot-64.png"
+                    sourceSize.width: 20
+                    sourceSize.height: 20
+                    Layout.preferredWidth: 20
+                    Layout.preferredHeight: 20
+                    smooth: true
+                    mipmap: true
+                }
                 Label {
                     text: "taskPilot"
                     font.family: root.theme.fontFamily
                     font.pixelSize: 13
                     font.weight: Font.DemiBold
                     color: root.theme.textPrimary
+                    Layout.leftMargin: -2
                 }
                 Item {
                     Layout.fillWidth: true

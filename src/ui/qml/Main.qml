@@ -69,5 +69,19 @@ ApplicationWindow {
         }
     }
 
+    // The daemon is local and the reply is small, so keep the queue fresh while
+    // the window is active: MCP-driven changes then show up during a live demo
+    // without anyone pressing F5.
+    Timer {
+        interval: 2500
+        running: window.active && window.visible
+        repeat: true
+        onTriggered: {
+            if (!appController.busy) {
+                appController.refresh()
+            }
+        }
+    }
+
     Component.onCompleted: appController.refresh()
 }

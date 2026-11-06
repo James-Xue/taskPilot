@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="160" y1="80" x2="900" y2="960" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0B63CE"/>
+      <stop offset="1" stop-color="#0A84FF"/>
+    </linearGradient>
+    <radialGradient id="sheen" cx="0.3" cy="0.08" r="0.9">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.16"/>
+      <stop offset="0.55" stop-color="#FFFFFF" stop-opacity="0.04"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="rim" x1="512" y1="64" x2="512" y2="960" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.55"/>
+      <stop offset="0.45" stop-color="#FFFFFF" stop-opacity="0.14"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0.05"/>
+    </linearGradient>
+    <linearGradient id="cardFront" x1="512" y1="576" x2="512" y2="732" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#D6E7FF"/>
+    </linearGradient>
+    <linearGradient id="chev" x1="512" y1="626" x2="512" y2="678" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFD166"/>
+      <stop offset="1" stop-color="#FF9F0A"/>
+    </linearGradient>
+    <filter id="cardShadow" x="-40%" y="-40%" width="180%" height="200%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="24" stdDeviation="28" flood-color="#00204D" flood-opacity="0.40"/>
+    </filter>
+    <filter id="softShadow" x="-40%" y="-60%" width="180%" height="220%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="10" stdDeviation="16" flood-color="#00204D" flood-opacity="0.22"/>
+    </filter>
+    <clipPath id="body">
+      <path d="M288 64H736C859.7 64 960 164.3 960 288V736C960 859.7 859.7 960 736 960H288C164.3 960 64 859.7 64 736V288C64 164.3 164.3 64 288 64Z"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#body)">
+    <path d="M288 64H736C859.7 64 960 164.3 960 288V736C960 859.7 859.7 960 736 960H288C164.3 960 64 859.7 64 736V288C64 164.3 164.3 64 288 64Z" fill="url(#bg)"/>
+    <path d="M288 64H736C859.7 64 960 164.3 960 288V736C960 859.7 859.7 960 736 960H288C164.3 960 64 859.7 64 736V288C64 164.3 164.3 64 288 64Z" fill="url(#sheen)"/>
+
+    <!-- stacked queue: receding cards, slight perspective -->
+    <rect x="347" y="300" width="330" height="94" rx="32" fill="#FFFFFF" fill-opacity="0.30" filter="url(#softShadow)" transform="rotate(-6 512 347)"/>
+    <rect x="316" y="420" width="392" height="116" rx="38" fill="#FFFFFF" fill-opacity="0.52" filter="url(#softShadow)" transform="rotate(-3 512 478)"/>
+
+    <!-- front card, elevated -->
+    <rect x="277" y="576" width="470" height="156" rx="46" fill="url(#cardFront)" filter="url(#cardShadow)"/>
+
+    <!-- priority chevron -->
+    <path d="M460 678L512 626L564 678" fill="none" stroke="url(#chev)" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <!-- inner rim highlight -->
+    <path d="M288 64H736C859.7 64 960 164.3 960 288V736C960 859.7 859.7 960 736 960H288C164.3 960 64 859.7 64 736V288C64 164.3 164.3 64 288 64Z" fill="none" stroke="url(#rim)" stroke-width="6"/>
+  </g>
+</svg>

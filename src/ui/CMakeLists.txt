@@ -64,4 +64,8 @@ qt_add_resources(taskpilot-ui "ui-qml"
         qml/AppTextField.qml
         qml/AppCheckBox.qml
         qml/AppSpinBox.qml
-        qml/AppScrollBar.qml)
+        qml/AppScrollBar.qml
+        icons/taskpilot.svg
+        icons/taskpilot-64.png
+        icons/taskpilot-256.png
+        icons/taskpilot-512.png)

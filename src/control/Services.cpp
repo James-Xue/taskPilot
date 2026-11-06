@@ -30,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -150,6 +151,50 @@ constexpr const char *kNowParamKey{ "__taskpilot_now" };
 
     out = std::move(parsed);
     return Unit{};
+}
+
+/// Trim ASCII whitespace, the way the desktop search box does before matching.
+[[nodiscard]] std::string trimmedAscii(std::string text)
+{
+    const auto isSpace = [](unsigned char value)
+    { return value == ' ' || value == '\t' || value == '\n' || value == '\r'; };
+
+    auto begin = text.begin();
+    while (begin != text.end() && isSpace(static_cast<unsigned char>(*begin)))
+    {
+        ++begin;
+    }
+    auto end = text.end();
+    while (end != begin && isSpace(static_cast<unsigned char>(*(end - 1))))
+    {
+        --end;
+    }
+    return std::string(begin, end);
+}
+
+/// Case-insensitive substring search over UTF-8 bytes.
+///
+/// Only ASCII letters are folded. Non-ASCII bytes (Chinese text, for example)
+/// have no case, and folding them through the locale could change a byte and
+/// break the match. This mirrors TaskFilterModel's title/notes search for the
+/// inputs it actually sees.
+[[nodiscard]] bool asciiCaseInsensitiveContains(const std::string &haystack,
+                                                const std::string &needle)
+{
+    if (needle.empty())
+    {
+        return true;
+    }
+    const auto fold = [](char value)
+    {
+        const auto byte = static_cast<unsigned char>(value);
+        return byte >= 'A' && byte <= 'Z' ? static_cast<char>(byte + ('a' - 'A'))
+                                          : static_cast<char>(byte);
+    };
+    const auto found = std::search(haystack.begin(), haystack.end(), needle.begin(),
+                                   needle.end(), [&fold](char lhs, char rhs)
+                                   { return fold(lhs) == fold(rhs); });
+    return found != haystack.end();
 }
 
 /// Narrow an int64 parameter onto one of Task's `int` fields.
@@ -568,6 +613,13 @@ const std::vector<MethodSpec> &Services::methodSpecs()
                       booleanProp("Whether tasks already in progress appear in the queue. "
                                   "Defaults to true; pass false to see only not-yet-"
                                   "started work.") },
+                    { "query",
+                      stringProp("Case-insensitive substring matched against a task's "
+                                 "title or notes. Omit or pass an empty string for no "
+                                 "text filter.") },
+                    { "tags",
+                      stringArrayProp("Only tasks carrying at least one of these tags "
+                                      "(OR). Matches the desktop Filters panel.") },
                 },
                 {}) });
 
@@ -581,7 +633,15 @@ const std::vector<MethodSpec> &Services::methodSpecs()
                     { "status",
                       stringProp("Only tasks in this state: open, in_progress, done or "
                                  "archived.") },
-                    { "tag", stringProp("Only tasks carrying this exact tag.") },
+                    { "tag", stringProp("Only tasks carrying this exact tag. Shorthand "
+                                        "for a one-element tags filter.") },
+                    { "tags",
+                      stringArrayProp("Only tasks carrying at least one of these tags "
+                                      "(OR). Combines with tag; both are unioned.") },
+                    { "query",
+                      stringProp("Case-insensitive substring matched against a task's "
+                                 "title or notes. Omit or pass an empty string for no "
+                                 "text filter.") },
                     { "limit",
                       integerProp("Return at most this many tasks. Omit or pass 0 for all "
                                   "of them.",
@@ -610,6 +670,14 @@ const std::vector<MethodSpec> &Services::methodSpecs()
             "queue. Finding that top entry ranks the whole actionable backlog — a "
             "bounded scan could only report the head of a subset — so use get_queue "
             "when you want the ranked list itself.",
+            objectSchema(nlohmann::json::object(), {}) });
+
+        specs.push_back(MethodSpec{
+            "get_tags",
+            "List every tag carried by an actionable task (open or in progress), with "
+            "how many tasks carry it, sorted by tag name. This is the data behind the "
+            "desktop client's Filters panel; use it to discover valid values before "
+            "calling list_tasks with a tag or tags filter.",
             objectSchema(nlohmann::json::object(), {}) });
 
         // --- synchronisation ---
@@ -1112,6 +1180,19 @@ RpcResult Services::handleGetQueue(const nlohmann::json &params)
         return read.error();
     }
 
+    std::string query;
+    if (const Status read = optionalString(params, "query", query); !read.ok())
+    {
+        return read.error();
+    }
+    query = trimmedAscii(std::move(query));
+
+    std::vector<std::string> tags;
+    if (const Status read = optionalStringArray(params, "tags", tags); !read.ok())
+    {
+        return read.error();
+    }
+
     const Result<Weights> weights = m_store.weights();
     if (!weights.ok())
     {
@@ -1133,6 +1214,36 @@ RpcResult Services::handleGetQueue(const nlohmann::json &params)
         std::erase_if(candidates, [](const Task &candidate) {
             return TaskStatus::kInProgress == candidate.status;
         });
+    }
+
+    // The desktop Filters panel applies text and tags to the ranked queue; do
+    // the same here, before ranking, so the limit is a limit on matches rather
+    // than on the whole backlog.
+    if (!query.empty() || !tags.empty())
+    {
+        std::erase_if(candidates,
+                      [&query, &tags](const Task &candidate)
+                      {
+                          if (!query.empty() &&
+                              !asciiCaseInsensitiveContains(candidate.title, query) &&
+                              !asciiCaseInsensitiveContains(candidate.notes, query))
+                          {
+                              return true;
+                          }
+                          if (!tags.empty())
+                          {
+                              const bool carries = std::any_of(
+                                  tags.begin(), tags.end(),
+                                  [&candidate](const std::string &tag)
+                                  {
+                                      return std::find(candidate.tags.begin(),
+                                                       candidate.tags.end(),
+                                                       tag) != candidate.tags.end();
+                                  });
+                              return !carries;
+                          }
+                          return false;
+                      });
     }
 
     // rank() drops anything not actionable, so done and archived tasks can
@@ -1192,6 +1303,41 @@ RpcResult Services::handleListTasks(const nlohmann::json &params)
         filter.tag = std::move(value);
     }
 
+    std::string query;
+    if (const Status read = optionalString(params, "query", query); !read.ok())
+    {
+        return read.error();
+    }
+    query = trimmedAscii(std::move(query));
+
+    std::vector<std::string> tags;
+    if (const Status read = optionalStringArray(params, "tags", tags); !read.ok())
+    {
+        return read.error();
+    }
+
+    // `tag` is the single-value shorthand; `tags` is the OR list. Union them so
+    // a caller mixing the two does not get one silently overriding the other.
+    std::vector<std::string> wantedTags;
+    if (filter.tag.has_value())
+    {
+        wantedTags.push_back(*filter.tag);
+    }
+    for (std::string &tag : tags)
+    {
+        if (std::find(wantedTags.begin(), wantedTags.end(), tag) == wantedTags.end())
+        {
+            wantedTags.push_back(std::move(tag));
+        }
+    }
+    // One tag stays in SQL; two or more are ORed below because the store's
+    // filter expresses exactly one tag element.
+    filter.tag.reset();
+    if (wantedTags.size() == 1)
+    {
+        filter.tag = wantedTags.front();
+    }
+
     std::optional<std::int64_t> limit;
     if (const Status read = optionalInt(params, "limit", limit); !read.ok())
     {
@@ -1227,6 +1373,39 @@ RpcResult Services::handleListTasks(const nlohmann::json &params)
         return tasks.error();
     }
     std::vector<Task> ordered = tasks.value();
+
+    // Text and multi-tag filters run here, after the store's status/single-tag
+    // pass and before ordering and the limit. Filtering after the limit would
+    // return fewer than `limit` rows that matched; filtering after ordering
+    // would be the same set, but this order keeps "first N matches" literal.
+    if (!query.empty() || wantedTags.size() > 1)
+    {
+        ordered.erase(
+            std::remove_if(ordered.begin(), ordered.end(),
+                           [&query, &wantedTags](const Task &task)
+                           {
+                               if (!query.empty() &&
+                                   !asciiCaseInsensitiveContains(task.title, query) &&
+                                   !asciiCaseInsensitiveContains(task.notes, query))
+                               {
+                                   return true;
+                               }
+                               if (wantedTags.size() > 1)
+                               {
+                                   const bool carriesWanted = std::any_of(
+                                       wantedTags.begin(), wantedTags.end(),
+                                       [&task](const std::string &wanted)
+                                       {
+                                           return std::find(task.tags.begin(),
+                                                            task.tags.end(),
+                                                            wanted) != task.tags.end();
+                                       });
+                                   return !carriesWanted;
+                               }
+                               return false;
+                           }),
+            ordered.end());
+    }
 
     if ("score" == order)
     {
@@ -1365,6 +1544,40 @@ RpcResult Services::handleGetStats(const nlohmann::json &params)
         result["top_score"] = ranked.front().score.total;
     }
     result["now"] = now;
+    return result;
+}
+
+RpcResult Services::handleGetTags(const nlohmann::json &params)
+{
+    static_cast<void>(params); // Takes no parameters.
+
+    const Result<std::vector<Task>> tasks = m_store.listTasks(TaskFilter{});
+    if (!tasks.ok())
+    {
+        return tasks.error();
+    }
+
+    // The desktop Filters panel counts tags on the actionable queue only:
+    // done and archived tasks are history, not filter candidates. std::map
+    // gives the alphabetical order the panel shows without a second sort.
+    std::map<std::string, int> counts;
+    for (const Task &task : tasks.value())
+    {
+        if (task.status != TaskStatus::kOpen && task.status != TaskStatus::kInProgress)
+        {
+            continue;
+        }
+        for (const std::string &tag : task.tags)
+        {
+            ++counts[tag];
+        }
+    }
+
+    nlohmann::json result = nlohmann::json::array();
+    for (const auto &[tag, count] : counts)
+    {
+        result.push_back({ { "tag", tag }, { "count", count } });
+    }
     return result;
 }
 
@@ -1511,6 +1724,7 @@ RpcResult Services::invoke(const std::string &method, const nlohmann::json &para
         { "list_tasks", &Services::handleListTasks },
         { "get_task", &Services::handleGetTask },
         { "get_stats", &Services::handleGetStats },
+        { "get_tags", &Services::handleGetTags },
         { "export_tasks", &Services::handleExportTasks },
         { "import_tasks", &Services::handleImportTasks },
         { "get_weights", &Services::handleGetWeights },
