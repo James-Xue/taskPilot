@@ -62,7 +62,7 @@ Item {
                     mipmap: true
                 }
                 Label {
-                    text: "taskPilot"
+                    text: "TaskPilot"
                     font.family: root.theme.fontFamily
                     font.pixelSize: 13
                     font.weight: Font.DemiBold

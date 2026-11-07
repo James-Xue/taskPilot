@@ -9,7 +9,7 @@ ApplicationWindow {
     height: 800
     minimumWidth: 900
     minimumHeight: 600
-    title: "taskPilot"
+    title: "TaskPilot"
     color: theme.windowBg
 
     Settings {
